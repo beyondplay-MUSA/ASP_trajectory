@@ -1,0 +1,3144 @@
+---
+title: "Análisis Biomecánico: Curvas vs Rectas"
+format: html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## 1️⃣ Configuración y Librerías
+
+```{python}
+import numpy as np
+import glob
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from scipy.ndimage import gaussian_filter
+from sklearn.linear_model import LinearRegression
+
+# Configuración de estilo global
+sns.set(style="whitegrid")
+plt.rcParams['figure.figsize'] = [10, 6]
+```
+
+## Funciones de Utilidad (Geometría y Física)
+
+```{python}
+import numpy as np
+import pandas as pd
+import glob
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.ndimage import gaussian_filter
+from scipy import stats
+
+# Configuración de estilo global
+sns.set(style="whitegrid")
+plt.rcParams['figure.figsize'] = [10, 6]
+
+# --- FUNCIONES AUXILIARES ---
+
+def latlon_to_xy(lat, lon):
+    """Convierte coordenadas GPS a metros (plano tangente)."""
+    R = 6371000.0
+    lat = np.deg2rad(lat)
+    lon = np.deg2rad(lon)
+    lat0 = lat[0]
+    lon0 = lon[0]
+    x = R * np.cos(lat0) * (lon - lon0)
+    y = R * (lat - lat0)
+    return x, y
+
+def moving_average(x, window):
+    """Suavizado simple (Rolling Mean) - Estilo v8.1"""
+    return pd.Series(x).rolling(window=window, center=True, min_periods=1).mean().values
+
+
+def compute_AS_profile_in_situ(df, speed_col="speed_kmh", acc_col="acc_analysis", v_min_ms=3.0, topN=2):
+    """Calcula perfil Aceleración-Velocidad (Linear Regression)."""
+    df_sub = df.copy()
+    df_sub['speed_ms'] = df_sub[speed_col] / 3.6
+    
+    v_max = df_sub['speed_ms'].max()
+    if pd.isna(v_max) or v_max < v_min_ms: return None, None
+    
+    bins = np.arange(v_min_ms, v_max + 0.2, 0.2)
+    df_sub['bin'] = pd.cut(df_sub['speed_ms'], bins=bins, include_lowest=True)
+    
+    # Top N aceleraciones por bin
+    df_reps = (df_sub.sort_values(acc_col, ascending=False)
+               .groupby('bin', observed=True).head(topN)
+               .dropna(subset=[acc_col]))
+    
+    if len(df_reps) < 5: return None, None
+    
+    X = df_reps['speed_ms'].values.reshape(-1, 1)
+    y = df_reps[acc_col].values
+    
+    if len(y) < 2: return None, None
+    
+    reg = LinearRegression().fit(X, y)
+    A0 = reg.intercept_
+    slope = reg.coef_[0]
+    
+    params = {'A0': A0, 'slope': slope}
+    
+    # Datos para graficar la línea
+    v_line_ms = np.linspace(df_reps['speed_ms'].min(), df_reps['speed_ms'].max(), 20)
+    acc_line = A0 + slope * v_line_ms
+    
+    line_data = pd.DataFrame({
+        'speed_kmh': v_line_ms * 3.6,
+        'acc_pred': acc_line
+    })
+    
+    return params, line_data
+```
+
+### Procesamiento Cinemático (Lógica Unificada)
+
+```{python}
+import numpy as np
+
+def compute_athlete_kinematics_v83(df, smooth_window_mov=5, smooth_sigma_gauss=1.0):
+    df_out = df.copy()
+
+    # --- 0. PREPARACIÓN COMÚN ---
+    t = df_out['time'].values
+    dt = np.median(np.diff(t))
+    if dt == 0 or np.isnan(dt):
+        dt = 0.05
+
+    x_raw, y_raw = latlon_to_xy(df_out['lat'].values, df_out['lon'].values)
+
+    # SUAVIZADOS DE POSICIÓN
+    x_mov = moving_average(x_raw, window=smooth_window_mov)
+    y_mov = moving_average(y_raw, window=smooth_window_mov)
+
+    x_gauss = gaussian_filter(x_raw, sigma=smooth_sigma_gauss)
+    y_gauss = gaussian_filter(y_raw, sigma=smooth_sigma_gauss)
+
+    # ------------------ FILTROS COMUNES (para TODOS los métodos) ------------------
+    LOW_SPEED = 0.6                 # m/s  (≈2.2 km/h)
+    MAX_SPEED_HUMAN = 14.0          # m/s
+    MAX_ACC_HUMAN = 15.0            # m/s²
+
+    MIN_ACC_NORM_FOR_RADIUS = 0.05  # m/s² (umbral giro real)
+    MIN_SPEED_FOR_RADIUS = LOW_SPEED
+
+    # Decide: low-speed como no interpretable (NaN) o como 0
+    LOW_SPEED_MODE = "nan"          # "nan" o "zero"
+
+    def apply_low_speed(mask_low, acc_tang, acc_norm, acc_total, radius):
+        if LOW_SPEED_MODE == "zero":
+            acc_tang[mask_low] = 0.0
+            acc_norm[mask_low] = 0.0
+            acc_total[mask_low] = 0.0
+        else:  # "nan"
+            acc_tang[mask_low] = np.nan
+            acc_norm[mask_low] = np.nan
+            acc_total[mask_low] = np.nan
+        radius[mask_low] = np.inf
+        return acc_tang, acc_norm, acc_total, radius
+
+    def apply_max_acc(a):
+        a = a.copy()
+        a[np.abs(a) > MAX_ACC_HUMAN] = np.nan
+        return a
+
+    # =========================================================================
+    # MÉTODO 1 (M1): HÍBRIDO (Tratamiento Anti-Ruido Mejorado)
+    # =========================================================================
+    speed_m1 = gaussian_filter(df_out['speed_kmh'].values / 3.6, sigma=smooth_sigma_gauss)
+    # Filtro velocidad máxima (común)
+    speed_m1[speed_m1 > MAX_SPEED_HUMAN] = np.nan
+
+    acc_tang_m1 = np.gradient(speed_m1, dt)
+
+    # 1. Cálculo del Heading (Dirección)
+    vx_g, vy_g = np.gradient(x_gauss, dt), np.gradient(y_gauss, dt)
+    heading = np.arctan2(vy_g, vx_g)
+
+    # 2. Cálculo de Omega (Velocidad Angular) Cruda
+    heading_unwrapped = np.unwrap(heading)
+    omega_m1_raw = np.gradient(heading_unwrapped, dt)
+
+    # --- TRATAMIENTO DE CHOQUE PARA M1 ---
+    omega_m1 = gaussian_filter(omega_m1_raw, sigma=1.5)
+
+    mask_low_speed_m1 = speed_m1 < LOW_SPEED
+    omega_m1[mask_low_speed_m1] = 0.0
+
+    omega_m1 = np.clip(omega_m1, -4.0, 4.0)
+
+    # 3. Aceleraciones M1
+    acc_norm_m1 = np.abs(speed_m1 * omega_m1)
+    acc_total_m1 = np.sqrt(acc_tang_m1**2 + acc_norm_m1**2)
+
+    # 4. Radio M1
+    radius_m1 = np.full_like(speed_m1, np.inf, dtype=float)
+    mask_curve_m1 = (np.abs(omega_m1) > 0.05) & (~mask_low_speed_m1)
+    radius_m1[mask_curve_m1] = speed_m1[mask_curve_m1] / np.abs(omega_m1[mask_curve_m1])
+
+    # Low-speed común (aplicado a salidas)
+    acc_tang_m1, acc_norm_m1, acc_total_m1, radius_m1 = apply_low_speed(
+        mask_low_speed_m1, acc_tang_m1, acc_norm_m1, acc_total_m1, radius_m1
+    )
+
+    # =========================================================================
+    # MÉTODO 2.1 (M2.1): POSICIONAL PURO - MEDIA MÓVIL
+    # =========================================================================
+    vx_m21 = np.gradient(x_mov, dt)
+    vy_m21 = np.gradient(y_mov, dt)
+    speed_m21 = np.sqrt(vx_m21**2 + vy_m21**2)
+    speed_m21[speed_m21 > MAX_SPEED_HUMAN] = np.nan
+
+    acc_tang_m21 = np.gradient(speed_m21, dt)
+
+    ax_m21 = np.gradient(vx_m21, dt)
+    ay_m21 = np.gradient(vy_m21, dt)
+    acc_total_m21 = np.sqrt(ax_m21**2 + ay_m21**2)
+
+    # 1) Low-speed común (antes)
+    mask_low_speed_m21 = speed_m21 < LOW_SPEED
+    if LOW_SPEED_MODE == "zero":
+        acc_tang_m21[mask_low_speed_m21] = 0.0
+        acc_total_m21[mask_low_speed_m21] = 0.0
+    else:
+        acc_tang_m21[mask_low_speed_m21] = np.nan
+        acc_total_m21[mask_low_speed_m21] = np.nan
+
+    # 2) Max-acc común (antes)
+    acc_tang_m21[np.abs(acc_tang_m21) > MAX_ACC_HUMAN] = np.nan
+    acc_total_m21[np.abs(acc_total_m21) > MAX_ACC_HUMAN] = np.nan
+
+    # 3) AHORA sí: normal pitagórica con señales ya filtradas
+    acc_sq_diff_m21 = acc_total_m21**2 - acc_tang_m21**2
+    acc_sq_diff_m21[acc_sq_diff_m21 < 0] = 0
+    acc_norm_m21 = np.sqrt(acc_sq_diff_m21)
+    acc_norm_m21[np.abs(acc_norm_m21) > MAX_ACC_HUMAN] = np.nan  # por coherencia
+
+    # 4) Recalcular radio con el mismo criterio
+    radius_m21 = np.full_like(speed_m21, np.inf, dtype=float)
+    mask_m21 = (acc_norm_m21 > MIN_ACC_NORM_FOR_RADIUS) & (speed_m21 > MIN_SPEED_FOR_RADIUS)
+    radius_m21[mask_m21] = (speed_m21[mask_m21]**2) / acc_norm_m21[mask_m21]
+
+    # (Y mantener: radius inf en low-speed)
+    radius_m21[mask_low_speed_m21] = np.inf
+    mask_m21 = (acc_norm_m21 > MIN_ACC_NORM_FOR_RADIUS) & (speed_m21 > MIN_SPEED_FOR_RADIUS)
+    radius_m21[mask_m21] = (speed_m21[mask_m21]**2) / acc_norm_m21[mask_m21]
+
+    # Low-speed común
+    mask_low_speed_m21 = speed_m21 < LOW_SPEED
+    acc_tang_m21, acc_norm_m21, acc_total_m21, radius_m21 = apply_low_speed(
+        mask_low_speed_m21, acc_tang_m21, acc_norm_m21, acc_total_m21, radius_m21
+    )
+
+    # =========================================================================
+    # MÉTODO 2.2 (M2.2): POSICIONAL PURO - GAUSSIANO + FILTROS (orden unificado)
+    # =========================================================================
+    vx_m22 = np.gradient(x_gauss, dt)
+    vy_m22 = np.gradient(y_gauss, dt)
+    speed_m22 = np.sqrt(vx_m22**2 + vy_m22**2)
+
+    # 0) Filtro común: velocidad máxima
+    speed_m22[speed_m22 > MAX_SPEED_HUMAN] = np.nan
+
+    # Tangencial desde la velocidad posicional
+    acc_tang_m22 = np.gradient(speed_m22, dt)
+
+    # Aceleración total desde doble derivada posicional
+    ax_m22 = np.gradient(vx_m22, dt)
+    ay_m22 = np.gradient(vy_m22, dt)
+    acc_total_m22 = np.sqrt(ax_m22**2 + ay_m22**2)
+
+    # 1) Filtro común: low-speed (ANTES de combinar componentes)
+    mask_low_speed_m22 = speed_m22 < LOW_SPEED
+    if LOW_SPEED_MODE == "zero":
+        acc_tang_m22[mask_low_speed_m22]  = 0.0
+        acc_total_m22[mask_low_speed_m22] = 0.0
+    else:  # "nan"
+        acc_tang_m22[mask_low_speed_m22]  = np.nan
+        acc_total_m22[mask_low_speed_m22] = np.nan
+
+    # 2) Filtro común: aceleración imposible (ANTES de calcular normal)
+    acc_tang_m22[np.abs(acc_tang_m22) > MAX_ACC_HUMAN]   = np.nan
+    acc_total_m22[np.abs(acc_total_m22) > MAX_ACC_HUMAN] = np.nan
+
+    # 3) Normal pitagórica (con señales ya filtradas)
+    acc_sq_diff_m22 = acc_total_m22**2 - acc_tang_m22**2
+    acc_sq_diff_m22[acc_sq_diff_m22 < 0] = 0
+    acc_norm_m22 = np.sqrt(acc_sq_diff_m22)
+
+    # (opcional pero coherente) cap de normal también
+    acc_norm_m22[np.abs(acc_norm_m22) > MAX_ACC_HUMAN] = np.nan
+
+    # 4) Total coherente (si quieres que “Total” sea consistente con Tang+Norm)
+    acc_total_m22 = np.sqrt(acc_tang_m22**2 + acc_norm_m22**2)
+
+    # 5) Radio (RECALCULADO al final con el criterio común)
+    radius_m22 = np.full_like(speed_m22, np.inf, dtype=float)
+    mask_m22 = (acc_norm_m22 > MIN_ACC_NORM_FOR_RADIUS) & (speed_m22 > MIN_SPEED_FOR_RADIUS)
+    radius_m22[mask_m22] = (speed_m22[mask_m22]**2) / acc_norm_m22[mask_m22]
+
+    # low-speed -> radio no interpretable
+    radius_m22[mask_low_speed_m22] = np.inf
+
+    # =========================================================================
+    # FILTRO DE ACC “IMPOSIBLE” (idéntico para TODOS, al final)
+    # =========================================================================
+    acc_tang_m1  = apply_max_acc(acc_tang_m1)
+    acc_norm_m1  = apply_max_acc(acc_norm_m1)
+    acc_total_m1 = apply_max_acc(acc_total_m1)
+
+    acc_tang_m21  = apply_max_acc(acc_tang_m21)
+    acc_norm_m21  = apply_max_acc(acc_norm_m21)
+    acc_total_m21 = apply_max_acc(acc_total_m21)
+
+    acc_tang_m22  = apply_max_acc(acc_tang_m22)
+    acc_norm_m22  = apply_max_acc(acc_norm_m22)
+    acc_total_m22 = apply_max_acc(acc_total_m22)
+
+    # =========================================================================
+    # GUARDADO
+    # =========================================================================
+    df_out['speed_m1']     = speed_m1
+    df_out['acc_tang_m1']  = acc_tang_m1
+    df_out['acc_norm_m1']  = acc_norm_m1
+    df_out['acc_total_m1'] = acc_total_m1
+    df_out['radius_m1']    = radius_m1
+
+    df_out['speed_m2_1']     = speed_m21
+    df_out['acc_tang_m2_1']  = acc_tang_m21
+    df_out['acc_norm_m2_1']  = acc_norm_m21
+    df_out['acc_total_m2_1'] = acc_total_m21
+    df_out['radius_m2_1']    = radius_m21
+
+    df_out['speed_m2_2']     = speed_m22
+    df_out['acc_tang_m2_2']  = acc_tang_m22
+    df_out['acc_norm_m2_2']  = acc_norm_m22
+    df_out['acc_total_m2_2'] = acc_total_m22
+    df_out['radius_m2_2']    = radius_m22
+
+    return df_out
+
+```
+
+## Carga y Limpieza de Datos
+
+```{python}
+# --- EJECUCIÓN DE CARGA (Adaptado v8.3) ---
+folder_path = "data/+datos/geyse"  # <--- AJUSTA TU RUTA AQUÍ
+
+try:
+    # 1. Usamos la nueva función de carga que busca CSVs
+    # NOTA: Asegúrate de que load_process_folder llame a 'compute_athlete_kinematics_v83'
+    # Copio aquí la función modificada para que no haya dudas:
+    
+    def load_process_folder_v83(folder_path):
+        files = glob.glob(os.path.join(folder_path, "*.csv"))
+        if not files:
+            files = glob.glob(os.path.join(folder_path, "**", "*.csv"), recursive=True)
+            if not files: raise ValueError(f"No hay CSVs en {folder_path}")
+        
+        print(f"📂 Procesando {len(files)} archivos con lógica v8.3...")
+        processed_dfs = []
+        
+        rename_map = {
+            "time (s)": "time", "Time": "time", "t": "time",
+            "acc (m/s2)": "acc", "speed (km/h)": "speed_kmh", 
+            "latitude": "lat", "longitude": "lon"
+        }
+
+        for f in files:
+            try:
+                df = pd.read_csv(f, sep=',' if ',' in open(f).readline() else ';')
+                df.columns = df.columns.str.strip()
+                for old, new in rename_map.items():
+                    if old in df.columns: df = df.rename(columns={old: new})
+                    elif old.lower() in [c.lower() for c in df.columns]:
+                        col_real = next(c for c in df.columns if c.lower() == old.lower())
+                        df = df.rename(columns={col_real: new})
+                
+                if 'time' not in df.columns: continue
+
+                # --- LLAMADA A LA LÓGICA V8.3 ---
+                df_kin = compute_athlete_kinematics_v83(df) # <--- CAMBIO IMPORTANTE
+                df_kin['source_file'] = os.path.basename(f)
+                processed_dfs.append(df_kin)
+            except Exception as e:
+                print(f"Error en {f}: {e}")
+
+        if not processed_dfs: raise ValueError("Error generando DataFrames")
+        return pd.concat(processed_dfs, ignore_index=True)
+
+    # 2. Ejecutar carga
+    df_full = load_process_folder_v83(folder_path)
+    
+    # 3. Definir columna por defecto para análisis rápidos
+    # Usamos la aceleración del sensor (acc) como el "oficial" analítico por defecto
+    df_full['acc_analysis'] = df_full['acc'] 
+        
+    print(f"✅ Datos cargados v8.3: {len(df_full)} filas. (Default: M1)")
+
+except Exception as e:
+    print(f"Error: {e}")
+```
+
+## Análisis de Regresión por Facetas (Matplotlib/Seaborn)
+
+```{python}
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# 1. Configuración
+df_plot = df_full.copy()
+target_speeds = [10, 15, 20] # Selecciona menos velocidades para que no se sature
+tolerance = 0.5
+max_radius = 60 
+
+# Pre-calculamos km/h para los 3 métodos
+df_plot['speed_kmh_m1']   = df_plot['speed_m1'] * 3.6
+df_plot['speed_kmh_m2_1'] = df_plot['speed_m2_1'] * 3.6
+df_plot['speed_kmh_m2_2'] = df_plot['speed_m2_2'] * 3.6
+
+data_list = []
+
+# 2. Bucle para extraer datos de los 3 métodos
+for v in target_speeds:
+    v_min, v_max = v - tolerance, v + tolerance
+    label_v = f"{v} km/h"
+    
+    # --- M1 (Sensor) ---
+    mask_m1 = (df_plot['speed_kmh_m1'].between(v_min, v_max)) & (df_plot['acc_tang_m1'] > 0)
+    sub_m1 = df_plot.loc[mask_m1]
+    if not sub_m1.empty:
+        data_list.append(pd.DataFrame({
+            'Radio': sub_m1['radius_m1'], 'Aceleracion': sub_m1['acc_tang_m1'],
+            'Velocidad_Target': label_v, 'Metodo': '1. M1: Sensor (Ref)'
+        }))
+
+    # --- M2.1 (Media Móvil - Sucio) ---
+    mask_m21 = (df_plot['speed_kmh_m2_1'].between(v_min, v_max)) & (df_plot['acc_tang_m2_1'] > 0)
+    sub_m21 = df_plot.loc[mask_m21]
+    if not sub_m21.empty:
+        data_list.append(pd.DataFrame({
+            'Radio': sub_m21['radius_m2_1'], 'Aceleracion': sub_m21['acc_tang_m2_1'],
+            'Velocidad_Target': label_v, 'Metodo': '2. M2.1: Media Móvil (Legacy)'
+        }))
+
+    # --- M2.2 (Gaussiano - Limpio) ---
+    mask_m22 = (df_plot['speed_kmh_m2_2'].between(v_min, v_max)) & (df_plot['acc_tang_m2_2'] > 0)
+    sub_m22 = df_plot.loc[mask_m22]
+    if not sub_m22.empty:
+        data_list.append(pd.DataFrame({
+            'Radio': sub_m22['radius_m2_2'], 'Aceleracion': sub_m22['acc_tang_m2_2'],
+            'Velocidad_Target': label_v, 'Metodo': '3. M2.2: Gaussiano (Modern)'
+        }))
+
+# 3. Graficar
+if data_list:
+    df_final = pd.concat(data_list, ignore_index=True)
+    df_final = df_final[(df_final['Radio'] < max_radius) & (df_final['Radio'] > 0)]
+
+    g = sns.lmplot(
+        data=df_final, x="Radio", y="Aceleracion",
+        col="Velocidad_Target", row="Metodo", # <--- Matriz 3 filas x N columnas
+        hue="Velocidad_Target",
+        height=3, aspect=1.5,
+        sharey=False, # Importante: M2.1 tendrá una escala Y loca (ruido), M2.2 será limpio
+        scatter_kws={'s': 10, 'alpha': 0.3},
+        line_kws={'color': 'black', 'linewidth': 1.5}
+    )
+    g.fig.subplots_adjust(top=0.9)
+    g.fig.suptitle('Impacto del Filtrado: Comparación de Dispersión', fontsize=16)
+    plt.show()
+else:
+    print("No hay datos suficientes para graficar.")
+```
+
+### Distribución de radios para ASP tradicional
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+def plot_as_profile_colored_by_radius(df_full, method_suffix='_m1', 
+                                      top_n=2, bin_size=0.2, 
+                                      max_radius_color=60):
+    """
+    1. Divide la velocidad en bins de 0.2 m/s.
+    2. Selecciona los 'top_n' puntos de mayor aceleración por bin.
+    3. Grafica estos puntos coloreándolos según su radio de giro.
+    4. Ajusta y dibuja la recta de regresión (Perfil AS).
+    """
+    
+    # 1. Configuración de columnas dinámica
+    col_speed = f'speed{method_suffix}'     
+    col_acc   = f'acc_tang{method_suffix}' 
+    col_rad   = f'radius{method_suffix}'   
+
+    # Nombres legibles para el título
+    method_name = {
+        '_m1': 'M1 (Sensor)', 
+        '_m2_1': 'M2.1 (Media Móvil)', 
+        '_m2_2': 'M2.2 (Gaussiano)'
+    }.get(method_suffix, method_suffix)
+
+    # 2. Preparación de datos
+    df = df_full.copy()
+    
+    # Cálculos previos necesarios
+    df['speed_ms'] = df[col_speed]
+    df['speed_kmh'] = df['speed_ms'] * 3.6
+    
+    # Filtro básico: Fase de propulsión y datos válidos
+    mask_valid = (
+        (df[col_acc] > 0) & 
+        (np.isfinite(df['speed_ms'])) & 
+        (np.isfinite(df[col_rad])) &
+        (df['speed_ms'] > 3.0) # Omitimos arrancada estática muy baja (< 10km/h) para limpiar regresión
+    )
+    df_clean = df.loc[mask_valid].copy()
+
+    # 3. Lógica de Bins y Selección Top N
+    v_max = df_clean['speed_ms'].max()
+    bins = np.arange(3.0, v_max + bin_size, bin_size)
+    
+    df_clean['bin'] = pd.cut(df_clean['speed_ms'], bins=bins, include_lowest=True)
+    
+    # --- EL CORAZÓN DEL ALGORITMO ---
+    # Ordenamos por aceleración descendente y nos quedamos con los 2 mejores de cada bin
+    df_profile = (
+        df_clean.sort_values(col_acc, ascending=False)
+        .groupby('bin', observed=True)
+        .head(top_n)
+    )
+    
+    if len(df_profile) < 5:
+        print(f"⚠️ No hay suficientes datos para generar el perfil con {method_name}")
+        return
+
+    # 4. Regresión Lineal (Perfil AS)
+    X = df_profile[['speed_ms']].values
+    y = df_profile[col_acc].values
+    
+    reg = LinearRegression().fit(X, y)
+    A0 = reg.intercept_
+    slope = reg.coef_[0]
+    S0_ms = -A0 / slope
+    S0_kmh = S0_ms * 3.6
+    R2 = reg.score(X, y)
+
+    # Crear línea para plotear
+    x_line = np.linspace(df_profile['speed_ms'].min(), S0_ms, 50)
+    y_line = A0 + slope * x_line
+
+    # 5. Visualización
+    plt.figure(figsize=(10, 6))
+    
+    # Scatter plot con mapa de color según Radio
+    # Usamos vmin/vmax para que los radios infinitos no rompan la escala de color
+    sc = plt.scatter(
+        df_profile['speed_kmh'], 
+        df_profile[col_acc], 
+        c=df_profile[col_rad], 
+        cmap='viridis_r', 
+        s=50, 
+        edgecolor='k', 
+        linewidth=0.5,
+        alpha=0.9,
+        vmin=0, vmax=max_radius_color # Saturamos el color a los 60m
+    )
+    
+    # Línea de regresión
+    plt.plot(x_line * 3.6, y_line, color='red', linestyle='--', linewidth=2, label='Perfil AS Teórico')
+    
+    # Barra de color
+    cbar = plt.colorbar(sc)
+    cbar.set_label('Radio de Giro (m) [Saturado a 60m]')
+
+    # Etiquetas y anotaciones
+    plt.title(f'Datos Base del Perfil F-V (Top {top_n} por bin) | Método: {method_name}', fontsize=14)
+    plt.xlabel('Velocidad (km/h)', fontsize=12)
+    plt.ylabel('Aceleración Tangencial (m/s²)', fontsize=12)
+    
+    # Caja de texto con parámetros
+    stats_text = (
+        f"$A_0$ (Max Acc): {A0:.2f} m/s²\n"
+        f"$S_0$ (Max Vel): {S0_kmh:.1f} km/h\n"
+        f"$R^2$: {R2:.2f}"
+    )
+    plt.text(0.95, 0.95, stats_text, transform=plt.gca().transAxes, 
+             fontsize=10, verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9))
+
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.xlim(left=10) # Ajustar según preferencia visual
+    plt.legend(loc='lower left')
+    plt.tight_layout()
+    plt.show()
+
+# --- EJECUCIÓN ---
+# Puedes cambiar '_m1' por '_m2_2' para ver la diferencia con el método Gaussiano
+plot_as_profile_colored_by_radius(df_full, method_suffix='_m1')
+```
+
+### Método envolvente (datos por defecto GPS)
+
+```{python}
+# -----------------------------------------------------------------------------
+# 1. Configuración de Variables por Método
+# -----------------------------------------------------------------------------
+df_plot = df_full.copy()
+
+# Definimos el mapeo de columnas para v8.3
+methods_config = {
+    'M1: Sensor (Ref)': {
+        'speed': 'speed_m1',     
+        'acc':   'acc_tang_m1',  
+        'rad':   'radius_m1'     
+    },
+    'M2.1: Pos (Media Móvil)': { 
+        'speed': 'speed_m2_1',     
+        'acc':   'acc_tang_m2_1',  
+        'rad':   'radius_m2_1'     
+    },
+    'M2.2: Pos (Gaussiano)': {   
+        'speed': 'speed_m2_2',     
+        'acc':   'acc_tang_m2_2',  
+        'rad':   'radius_m2_2'     
+    }
+}
+
+target_speeds = [10, 15, 20] # km/h
+tolerance = 0.5
+bin_width = 1       
+percentile_limit = 0.99 
+max_radius = 60     
+
+# -----------------------------------------------------------------------------
+# 2. Algoritmo de Cálculo de Envolventes
+# -----------------------------------------------------------------------------
+envelope_data = []
+
+print("Calculando envolventes para los 3 métodos...")
+
+for v_target in target_speeds:
+    v_min = v_target - tolerance
+    v_max = v_target + tolerance
+    
+    # Iteramos por cada método configurado
+    for method_name, cols in methods_config.items():
+        
+        # 1. Extraer vectores
+        s_vec_kmh = df_plot[cols['speed']] * 3.6 
+        a_vec = df_plot[cols['acc']]
+        r_vec = df_plot[cols['rad']]
+        
+        temp_df = pd.DataFrame({'Speed_kmh': s_vec_kmh, 'Acc_Value': a_vec, 'Radio': r_vec})
+        
+        # 2. Filtrar
+        mask = (
+            (temp_df['Speed_kmh'] >= v_min) & 
+            (temp_df['Speed_kmh'] <= v_max) & 
+            (temp_df['Acc_Value'] > 0) & 
+            (temp_df['Radio'] > 0) & 
+            (temp_df['Radio'] < max_radius)
+        )
+        
+        subset = temp_df.loc[mask].copy()
+        
+        if len(subset) < 15: continue
+
+        # 3. Binning y P99
+        bins = np.arange(0, max_radius + bin_width, bin_width)
+        subset['R_bin'] = pd.cut(subset['Radio'], bins=bins)
+        
+        envelope = subset.groupby('R_bin', observed=True)['Acc_Value'].quantile(percentile_limit).reset_index()
+        envelope['Radio_Mid'] = envelope['R_bin'].apply(lambda x: x.mid).astype(float)
+        envelope = envelope.dropna()
+        
+        envelope['Metodo'] = method_name
+        envelope['Velocidad_Target'] = f"{v_target} km/h"
+        
+        envelope_data.append(envelope)
+
+if not envelope_data:
+    raise ValueError("No se generaron datos. Revisa los filtros.")
+
+df_envelopes = pd.concat(envelope_data, ignore_index=True)
+
+# -----------------------------------------------------------------------------
+# 3. Visualización (3 Filas x 3 Columnas)
+# -----------------------------------------------------------------------------
+g = sns.lmplot(
+    data=df_envelopes,
+    x="Radio_Mid", 
+    y="Acc_Value", 
+    row="Metodo",             # <-- Ahora creará 3 filas automáticamente
+    col="Velocidad_Target",   
+    hue="Velocidad_Target", 
+    height=3.0,               # Un poco más bajo porque ahora son 3 filas
+    aspect=1.3,
+    sharex=True, 
+    sharey=False, 
+    scatter_kws={'s': 40, 'edgecolor': 'white', 'alpha': 0.8},
+    line_kws={'linewidth': 2, 'color': '#333333'}
+)
+
+# Función de anotación estadística
+def annotate_stats(data, **kws):
+    if len(data) < 2: return
+    r = data['Radio_Mid'].corr(data['Acc_Value'])
+    if np.isnan(r): r = 0
+    poly = np.polyfit(data['Radio_Mid'], data['Acc_Value'], 1)
+    m = poly[0] 
+    ax = plt.gca()
+    ax.text(0.95, 0.9, f"m: {m:.3f}\nr: {r:.2f}", transform=ax.transAxes, 
+            fontsize=9, ha='right', va='top',
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.9, ec="gray"))
+
+g.map_dataframe(annotate_stats)
+
+g.set_axis_labels("Radio de Giro (m)", "Aceleración tangencial (P99) [m/s²]")
+g.fig.subplots_adjust(top=0.92)
+g.fig.suptitle('Comparativa v8.3: Sensor vs Media Móvil vs Gaussiano', fontsize=16)
+
+for ax in g.axes.flatten():
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+plt.show()
+```
+
+## Envolvente aceleración tangencial por método. Selección m1, m2_1 o m2_2
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+# -----------------------------------------------------------------------------
+# 0. Función Auxiliar para Estadísticas
+# -----------------------------------------------------------------------------
+def annotate_stats(data, x, y, **kws):
+    if len(data) < 2: return
+    slope, intercept, r_value, p_value, std_err = stats.linregress(data[x], data[y])
+    ax = plt.gca()
+    # Escribimos m y r en la esquina superior derecha
+    ax.text(0.95, 0.85, f'm={slope:.3f}\nr={r_value:.2f}',
+            transform=ax.transAxes, ha='right', fontsize=9, fontweight='bold',
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+
+# -----------------------------------------------------------------------------
+# 1. Configuración y Selección de Método
+# -----------------------------------------------------------------------------
+# --- ¡ELIGE AQUÍ EL MÉTODO A ANALIZAR! ---
+
+# '_m1'   = Sensor Híbrido
+# '_m2_2' = Pitagórico Gaussiano (El recomendado)
+# '_m2_1' = Pitagórico Media Móvil
+
+METHOD_SUFFIX = '_m2_2'  # <--- CAMBIA ESTO PARA VER OTROS MÉTODOS
+
+# Diccionario de títulos limpios (sin "sucio/limpio")
+titles_map = {
+    '_m1':   'M1: Híbrido (Sensor)',
+    '_m2_1': 'M2.1: Pitagórico (Media Móvil)',
+    '_m2_2': 'M2.2: Pitagórico (Gaussiano)'
+}
+current_title_method = titles_map.get(METHOD_SUFFIX, METHOD_SUFFIX)
+
+# Construcción dinámica de nombres de columna según el sufijo elegido
+col_speed  = f'speed{METHOD_SUFFIX}'      
+col_radius = f'radius{METHOD_SUFFIX}'     
+col_total  = f'acc_total{METHOD_SUFFIX}'  
+col_tang   = f'acc_tang{METHOD_SUFFIX}'   
+col_norm   = f'acc_norm{METHOD_SUFFIX}'   
+
+print(f"📊 Generando análisis desglosado para: {current_title_method}")
+
+df_plot = df_full.copy()
+
+# Estandarizamos velocidad a km/h para el filtrado
+df_plot['speed_kmh_analysis'] = df_plot[col_speed] * 3.6
+
+# Filtro Global: Solo fases de PROPULSIÓN (Acc Tangencial > 0)
+# Esto es vital para que la envolvente tenga sentido físico en sprints
+if col_tang in df_plot.columns:
+    df_plot = df_plot[df_plot[col_tang] > 0]
+
+# Mapeo de componentes: Esto asegura que salgan las 3 filas
+acc_types = {
+    col_total: 'Aceleración Total', 
+    col_tang:  'Aceleración Tangencial',
+    col_norm:  'Aceleración Normal'
+}
+
+radius_col = col_radius 
+target_speeds = [10, 15, 20] # km/h
+tolerance = 0.5
+bin_width = 1.0       
+percentile_limit = 0.99 
+max_radius = 60
+
+# -----------------------------------------------------------------------------
+# 2. Cálculo de Envolventes (P99) para CADA componente
+# -----------------------------------------------------------------------------
+envelope_data = []
+
+for speed in target_speeds:
+    v_min, v_max = speed - tolerance, speed + tolerance
+    
+    # Filtro por rango de velocidad
+    df_speed = df_plot[df_plot['speed_kmh_analysis'].between(v_min, v_max)]
+    
+    # Bucle interno: Iteramos por Total, Tangencial y Normal
+    for col_acc, name_acc in acc_types.items():
+        if col_acc not in df_speed.columns: continue
+
+        subset = df_speed[[col_acc, radius_col]].copy()
+        subset.columns = ['Acc_Value', 'Radio']
+        
+        # Limpieza de infinitos y nulos
+        subset = subset.replace([np.inf, -np.inf], np.nan).dropna()
+        subset = subset[(subset['Radio'] > 0) & (subset['Radio'] < max_radius)]
+        
+        if len(subset) < 15: continue 
+
+        # Binning por radio
+        bins = np.arange(0, max_radius + bin_width, bin_width)
+        subset['R_bin'] = pd.cut(subset['Radio'], bins=bins)
+        
+        # Calcular el P99 (Techo de rendimiento)
+        envelope = subset.groupby('R_bin', observed=True)['Acc_Value'].quantile(percentile_limit).reset_index()
+        envelope['Radio_Mid'] = envelope['R_bin'].apply(lambda x: x.mid).astype(float)
+        envelope = envelope.dropna()
+        
+        # Etiquetas para el gráfico
+        envelope['Tipo_Acc'] = name_acc
+        envelope['Velocidad_Target'] = f"{speed} km/h"
+        
+        envelope_data.append(envelope)
+
+if not envelope_data:
+    raise ValueError(f"No hay datos suficientes para {METHOD_SUFFIX}. Revisa si 'compute_athlete_kinematics_v83' se ejecutó correctamente.")
+
+df_envelopes = pd.concat(envelope_data, ignore_index=True)
+
+# -----------------------------------------------------------------------------
+# 3. Visualización (FacetGrid: Filas=Tipo, Col=Velocidad)
+# -----------------------------------------------------------------------------
+g = sns.lmplot(
+    data=df_envelopes,
+    x="Radio_Mid", 
+    y="Acc_Value",
+    row="Tipo_Acc",          # <--- ESTO GENERA LAS 3 FILAS (Total, Tang, Norm)
+    col="Velocidad_Target",  
+    hue="Velocidad_Target",
+    height=3.5, 
+    aspect=1.4,
+    scatter_kws={'s': 40, 'edgecolor': 'white', 'alpha': 0.8},
+    line_kws={'linewidth': 2, 'color': '#333333'},
+    facet_kws={'sharey': 'row', 'sharex': True}
+)
+
+g.map_dataframe(annotate_stats, x="Radio_Mid", y="Acc_Value")
+
+# -----------------------------------------------------------------------------
+# 4. Estética Final
+# -----------------------------------------------------------------------------
+g.fig.suptitle(f'Descomposición de Componentes: {current_title_method}', fontsize=16)
+
+g.set_titles(col_template="{col_name}", row_template="")
+g.set_axis_labels("Radio de Giro (m)", "") 
+
+# Etiquetas manuales para el eje Y de cada fila
+labels_por_fila = ["Total (m/s²)", "Tangencial (m/s²)", "Normal (m/s²)"]
+for i, ax_row in enumerate(g.axes):
+    if i < len(labels_por_fila):
+        ax_row[0].set_ylabel(labels_por_fila[i], fontsize=10, fontweight='bold')
+
+g.fig.subplots_adjust(top=0.90, left=0.10)
+
+# Colorear títulos de columnas
+colores_columna = ['#4c72b0', '#dd8452', '#55a868'] 
+for col_idx in range(g.axes.shape[1]):
+    c = colores_columna[col_idx] if col_idx < len(colores_columna) else 'black'
+    for row_idx in range(g.axes.shape[0]):
+        ax = g.axes[row_idx, col_idx]
+        if ax.get_title():
+            ax.set_title(ax.get_title().replace('|','').strip(), color=c, fontweight='bold')
+        ax.grid(True, linestyle='--', alpha=0.5)
+
+plt.show()
+```
+
+### Visualización percentiles acc tangencial
+
+```{python}
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# ---------------------------------------------------------------------
+# 0) Anotación de stats de regresión
+# ---------------------------------------------------------------------
+def annotate_stats(data, x, y, **kws):
+    data = data[[x, y]].dropna()
+    if len(data) < 2:
+        return
+    slope, intercept, r_value, p_value, std_err = stats.linregress(data[x], data[y])
+    ax = plt.gca()
+    ax.text(
+        0.95, 0.85, f"m: {slope:.3f}\nr: {r_value:.2f}",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7)
+    )
+
+# ---------------------------------------------------------------------
+# 1) Función: Envolvente por radio para varios percentiles
+# ---------------------------------------------------------------------
+def build_envelopes_multi_percentiles(
+    df_full,
+    method_suffix="_m1",
+    target_speeds=(10, 15, 20),      # km/h
+    tolerance=0.5,                   # km/h
+    percentiles=(0.50, 0.75, 0.90, 0.95, 0.99),
+    bin_width=2.0,                   # m
+    max_radius=80,                   # m
+    min_points_bin=30,               # min obs por bin para usar ese bin
+    propulsive_only=True,            # filtra acc_tang>0
+):
+    # Columnas dinámicas (tu naming)
+    col_speed  = f"speed{method_suffix}"
+    col_radius = f"radius{method_suffix}"
+    col_tang   = f"acc_tang{method_suffix}"
+
+    df = df_full.copy()
+
+    # Velocidad a km/h
+    df["v_kmh"] = df[col_speed] * 3.6
+
+    # Limpieza base
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["v_kmh", col_radius, col_tang])
+
+    # Filtro radio útil
+    df = df[(df[col_radius] > 0) & (df[col_radius] < max_radius)]
+
+    # Filtro propulsión (fase de aceleración)
+    if propulsive_only:
+        df = df[df[col_tang] > 0]
+
+    # Bins de radio
+    bins = np.arange(0, max_radius + bin_width, bin_width)
+
+    envelopes = []
+
+    for sp in target_speeds:
+        vmin, vmax = sp - tolerance, sp + tolerance
+        df_sp = df[df["v_kmh"].between(vmin, vmax)].copy()
+        if df_sp.empty:
+            continue
+
+        df_sp["r_bin"] = pd.cut(df_sp[col_radius], bins=bins, include_lowest=True)
+
+        # Para cada bin, percentiles de acc_tang
+        grp = df_sp.groupby("r_bin", observed=True)[col_tang]
+
+        # solo bins con suficiente n
+        n_bin = grp.size()
+        valid_bins = n_bin[n_bin >= min_points_bin].index
+
+        if len(valid_bins) == 0:
+            continue
+
+        for p in percentiles:
+            q = (grp.quantile(p)
+                   .loc[valid_bins]
+                   .reset_index(name="Acc_Value"))
+            q["Radio_Mid"] = q["r_bin"].apply(lambda x: x.mid).astype(float)
+            q["Percentil"] = f"P{int(p*100)}"
+            q["Velocidad_Target"] = f"{sp} km/h"
+            q["p_float"] = p
+            q["n_bin"] = n_bin.loc[valid_bins].values
+            envelopes.append(q)
+
+    if not envelopes:
+        raise ValueError("No se generaron envolventes. Revisa filtros / columnas / datos.")
+    return pd.concat(envelopes, ignore_index=True)
+
+# ---------------------------------------------------------------------
+# 2) Configuración: método y títulos
+# ---------------------------------------------------------------------
+METHOD_SUFFIX = "_m1"  # cambia a "_m2_1" o "_m2_2"
+
+titles_map = {
+    "_m1":   "M1: Híbrido (Sensor)",
+    "_m2_1": "M2.1: Pitagórico (Media Móvil)",
+    "_m2_2": "M2.2: Pitagórico (Gaussiano)",
+}
+method_title = titles_map.get(METHOD_SUFFIX, METHOD_SUFFIX)
+
+# ---------------------------------------------------------------------
+# 3) Construcción de envolventes multi-percentiles
+# ---------------------------------------------------------------------
+df_env = build_envelopes_multi_percentiles(
+    df_full,
+    method_suffix=METHOD_SUFFIX,
+    target_speeds=(10, 15, 20),
+    tolerance=0.5,
+    percentiles=(0.50, 0.75, 0.90, 0.95, 0.99),
+    bin_width=2.0,
+    max_radius=80,
+    min_points_bin=30,
+    propulsive_only=True,   # <- tu objetivo: "fase de aceleración"
+)
+
+# ---------------------------------------------------------------------
+# 4) Plot: filas = Percentil, columnas = Velocidad (estilo anterior)
+# ---------------------------------------------------------------------
+sns.set_style("whitegrid")
+
+# Orden visual de percentiles
+order_p = ["P50","P75","P90","P95","P99"]
+
+g = sns.lmplot(
+    data=df_env,
+    x="Radio_Mid",
+    y="Acc_Value",
+    row="Percentil",
+    row_order=order_p,
+    col="Velocidad_Target",
+    col_order=[f"{s} km/h" for s in (10, 15, 20)],
+    hue="Velocidad_Target",  # colores por columna (como tu figura)
+    height=3.3,
+    aspect=1.35,
+    scatter_kws={"s": 38, "edgecolor": "white", "alpha": 0.85},
+    line_kws={"linewidth": 2, "color": "#333333"},
+    facet_kws={"sharex": True, "sharey": "row"},
+)
+
+g.map_dataframe(annotate_stats, x="Radio_Mid", y="Acc_Value")
+
+g.fig.suptitle(f"Envolventes por percentil (fase propulsiva): {method_title}", fontsize=16)
+g.set_axis_labels("Radio de giro (m)", "acc_tang (m/s²)")
+
+# Estética títulos de columnas (colores estilo)
+colores_columna = ["#4c72b0", "#dd8452", "#55a868"]
+for col_idx in range(g.axes.shape[1]):
+    c = colores_columna[col_idx] if col_idx < len(colores_columna) else "black"
+    for row_idx in range(g.axes.shape[0]):
+        ax = g.axes[row_idx, col_idx]
+        if ax.get_title():
+            ax.set_title(ax.get_title().replace("|", "").strip(),
+                         color=c, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+# Etiqueta izquierda por fila (Percentil)
+for i, ax_row in enumerate(g.axes):
+    ax_row[0].set_ylabel(f"{order_p[i]}  acc_tang (m/s²)", fontsize=10, fontweight="bold")
+
+g.fig.subplots_adjust(top=0.92, left=0.10)
+plt.show()
+
+```
+
+### Diagrama de dispersión para todas las velocidades
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import matplotlib.colors as colors
+
+# -----------------------------------------------------------------------------
+# 1. PREPARACIÓN DE DATOS (Adaptado a v8.3 con 3 Métodos)
+# -----------------------------------------------------------------------------
+methods_map = {
+    '1. M1: Híbrido (Sensor)': {
+        'speed': 'speed_m1', 
+        'radius': 'radius_m1',
+        'accs': {'acc_total_m1': 'Total', 'acc_tang_m1': 'Tangencial', 'acc_norm_m1': 'Normal'}
+    },
+    '2. M2.1: Pitagórico (Media Móvil)': {
+        'speed': 'speed_m2_1', 
+        'radius': 'radius_m2_1',
+        'accs': {'acc_total_m2_1': 'Total', 'acc_tang_m2_1': 'Tangencial', 'acc_norm_m2_1': 'Normal'}
+    },
+    '3. M2.2: Pitagórico (Gaussiano)': {
+        'speed': 'speed_m2_2', 
+        'radius': 'radius_m2_2',
+        'accs': {'acc_total_m2_2': 'Total', 'acc_tang_m2_2': 'Tangencial', 'acc_norm_m2_2': 'Normal'}
+    }
+}
+
+data_viz = []
+MIN_SPEED_VIS = 2       # km/h
+MAX_RADIUS_COLOR = 30   # Para la escala de color logarítmica
+
+print("🔄 Procesando datos para Mapa de Rendimiento 3x3...")
+
+for method_name, cols in methods_map.items():
+    # Extraemos velocidad en km/h
+    v_kmh = df_full[cols['speed']] * 3.6
+    r_val = df_full[cols['radius']]
+    
+    for col_acc, acc_label in cols['accs'].items():
+        # Verificamos que la columna exista (por seguridad)
+        if col_acc not in df_full.columns: continue
+        
+        temp_df = pd.DataFrame({
+            'Velocidad (km/h)': v_kmh,
+            'Aceleración': df_full[col_acc],
+            'Radio (m)': r_val,
+            'Tipo': acc_label,       # Columna del gráfico (Total, Tang, Normal)
+            'Método': method_name    # Fila del gráfico (M1, M2.1, M2.2)
+        })
+        
+        # Filtros básicos de visualización
+        mask = (temp_df['Velocidad (km/h)'] > MIN_SPEED_VIS) & \
+               (temp_df['Radio (m)'] > 0) & \
+               (temp_df['Radio (m)'] < 200)
+        
+        data_viz.append(temp_df[mask])
+
+df_scatter = pd.concat(data_viz, ignore_index=True)
+
+# --- DOWNSAMPLING (Protección RAM) ---
+# Al tener 3 métodos x 3 variables, los puntos se multiplican. Limitamos a 60k.
+MAX_POINTS = 600000 
+if len(df_scatter) > MAX_POINTS:
+    df_scatter = df_scatter.sample(n=MAX_POINTS, random_state=42)
+
+# -----------------------------------------------------------------------------
+# 2. VISUALIZACIÓN CON ETIQUETAS MEJORADAS
+# -----------------------------------------------------------------------------
+# Definimos orden para que salga siempre: Tangencial -> Total -> Normal
+col_order = ['Tangencial', 'Total', 'Normal']
+row_order = ['1. M1: Híbrido (Sensor)', '2. M2.1: Pitagórico (Media Móvil)', '3. M2.2: Pitagórico (Gaussiano)']
+
+g = sns.relplot(
+    data=df_scatter,
+    x="Velocidad (km/h)",
+    y="Aceleración",
+    hue="Radio (m)",
+    col="Tipo",           # Columnas
+    row="Método",         # Filas
+    col_order=col_order,
+    row_order=row_order,
+    palette="viridis_r",       
+    hue_norm=colors.LogNorm(vmin=1, vmax=MAX_RADIUS_COLOR), 
+    kind="scatter",
+    height=3.0,           # Un poco más pequeño porque ahora son 3 filas
+    aspect=1.3,
+    alpha=0.6, s=10,      # Puntos más pequeños para ver densidad
+    facet_kws={'sharex': True, 'sharey': False} # ShareY=False es vital: M2.1 tendrá escalas locas
+)
+
+# -----------------------------------------------------------------------------
+# 3. LIMPIEZA Y ESTÉTICA
+# -----------------------------------------------------------------------------
+
+# A. Títulos de cajas limpios
+g.set_titles(col_template="{col_name}", row_template="{row_name}", size=11, fontweight='bold')
+
+# B. Etiquetas de Ejes
+g.set_axis_labels("Velocidad (km/h)", "Aceleración (m/s²)")
+
+# C. Ajustes visuales globales
+g.fig.subplots_adjust(top=0.9)
+g.fig.suptitle(f'Comparativa de Métodos (n={len(df_scatter)})', fontsize=16)
+
+# D. Límites visuales (Zoom a zona humana)
+# Nota: M2.1 tendrá puntos fuera de este gráfico, pero así vemos el "core" de datos útiles
+g.set(xlim=(0, 35), ylim=(0, 15)) 
+
+for ax in g.axes.flatten():
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.axhline(0, color='black', linewidth=0.5, alpha=0.5)
+
+plt.show()
+```
+
+### Comparación de resultados con otra base de datos. Datos NFL para 4 semanas de 1 jugador (WR)
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.colors as colors
+from scipy.ndimage import gaussian_filter
+
+# -----------------------------------------------------------------------------
+# 0. FUNCIÓN AUXILIAR (Necesaria para M2.1)
+# -----------------------------------------------------------------------------
+def moving_average(x, window):
+    return pd.Series(x).rolling(window=window, center=True, min_periods=1).mean().values
+
+# -----------------------------------------------------------------------------
+# 1. Carga Robusta de Datos
+# -----------------------------------------------------------------------------
+df_nfl = pd.read_csv("data/nfl/ejemplo_nfl.csv", sep=';')
+
+# -----------------------------------------------------------------------------
+# 2. CONVERSIÓN DE UNIDADES (Yardas -> Metros)
+# -----------------------------------------------------------------------------
+YARDS_TO_METERS = 0.9144
+
+if 'x' in df_nfl.columns:
+    df_nfl['x_m'] = df_nfl['x'] * YARDS_TO_METERS
+    df_nfl['y_m'] = df_nfl['y'] * YARDS_TO_METERS
+    # En NFL 's' suele ser yardas/segundo
+    df_nfl['s_ms'] = df_nfl['s'] * YARDS_TO_METERS
+else:
+    raise KeyError("La columna 'x' no se encuentra en el archivo.")
+
+# -----------------------------------------------------------------------------
+# 3. FUNCIÓN DE CINEMÁTICA (ADAPTADA A 3 MÉTODOS)
+# -----------------------------------------------------------------------------
+def compute_nfl_kinematics_v3(group):
+    # Asegurar orden temporal
+    group = group.sort_values('frameId')
+    
+    # Parámetros para 10Hz (Típico NFL)
+    dt = 0.1
+    smooth_sigma = 1.0   # Para Gaussiano (M1 y M2.2)
+    window_mov = 5       # Para Media Móvil (M2.1)
+    
+    if len(group) < 5: return None
+    
+    # --- BASES DE POSICIÓN ---
+    # Base A: Media Móvil (Ruidosa)
+    x_mov = moving_average(group['x_m'].values, window=window_mov)
+    y_mov = moving_average(group['y_m'].values, window=window_mov)
+    
+    # Base B: Gaussiana (Suave)
+    x_gauss = gaussian_filter(group['x_m'].values, sigma=smooth_sigma)
+    y_gauss = gaussian_filter(group['y_m'].values, sigma=smooth_sigma)
+    s_gauss = gaussian_filter(group['s_ms'].values, sigma=smooth_sigma)
+
+    # =========================================================================
+    # MÉTODO 1: HÍBRIDO (Usa velocidad del sensor 's' suavizada)
+    # =========================================================================
+    vx_geom = np.gradient(x_gauss, dt)
+    vy_geom = np.gradient(y_gauss, dt)
+    heading = np.arctan2(vy_geom, vx_geom)
+    omega = np.gradient(np.unwrap(heading), dt)
+
+    acc_tang_m1 = np.gradient(s_gauss, dt)
+    acc_norm_m1 = np.abs(s_gauss * omega)
+    acc_total_m1 = np.sqrt(acc_tang_m1**2 + acc_norm_m1**2)
+
+    radius_m1 = np.full_like(s_gauss, np.inf)
+    mask_m1 = (np.abs(omega) > 0.05) & (s_gauss > 0.5)
+    radius_m1[mask_m1] = s_gauss[mask_m1] / np.abs(omega[mask_m1])
+
+    # =========================================================================
+    # MÉTODO 2.1: PITAGÓRICO (Media Móvil - Legacy)
+    # =========================================================================
+    vx_m21 = np.gradient(x_mov, dt)
+    vy_m21 = np.gradient(y_mov, dt)
+    speed_m21 = np.sqrt(vx_m21**2 + vy_m21**2)
+
+    ax_m21 = np.gradient(vx_m21, dt)
+    ay_m21 = np.gradient(vy_m21, dt)
+    acc_total_m21 = np.sqrt(ax_m21**2 + ay_m21**2)
+
+    acc_tang_m21 = np.gradient(speed_m21, dt)
+    
+    # Normal (Pitagórica)
+    acc_sq_diff_m21 = acc_total_m21**2 - acc_tang_m21**2
+    acc_sq_diff_m21[acc_sq_diff_m21 < 0] = 0 
+    acc_norm_m21 = np.sqrt(acc_sq_diff_m21)
+    
+    # Radio M2.1
+    radius_m21 = np.full_like(speed_m21, np.inf)
+    mask_m21 = (acc_norm_m21 > 0.1) & (speed_m21 > 0.5)
+    radius_m21[mask_m21] = (speed_m21[mask_m21]**2) / acc_norm_m21[mask_m21]
+
+    # =========================================================================
+    # MÉTODO 2.2: PITAGÓRICO (Gaussiano - Modern & Clean)
+    # =========================================================================
+    vx_m22 = np.gradient(x_gauss, dt)
+    vy_m22 = np.gradient(y_gauss, dt)
+    speed_m22 = np.sqrt(vx_m22**2 + vy_m22**2)
+
+    ax_m22 = np.gradient(vx_m22, dt)
+    ay_m22 = np.gradient(vy_m22, dt)
+    acc_total_m22_raw = np.sqrt(ax_m22**2 + ay_m22**2)
+
+    acc_tang_m22 = np.gradient(speed_m22, dt)
+    
+    # --- FILTRADO BIOMECÁNICO ---
+    MIN_SPEED = 0.5 # m/s
+    MAX_ACC = 15.0  # m/s²
+    
+    # 1. Estáticos
+    mask_static = speed_m22 < MIN_SPEED
+    acc_tang_m22[mask_static] = 0
+    acc_total_m22_raw[mask_static] = 0
+    
+    # 2. Outliers
+    mask_outlier = acc_total_m22_raw > MAX_ACC
+    acc_total_m22 = acc_total_m22_raw.copy()
+    acc_total_m22[mask_outlier] = np.nan
+    acc_tang_m22[mask_outlier] = np.nan
+    
+    # Recalcular normal limpia
+    acc_sq_diff_m22 = acc_total_m22**2 - acc_tang_m22**2
+    acc_sq_diff_m22[acc_sq_diff_m22 < 0] = 0 
+    acc_norm_m22 = np.sqrt(acc_sq_diff_m22)
+
+    radius_m22 = np.full_like(speed_m22, np.inf)
+    mask_m22 = (acc_norm_m22 > 0.1) & (speed_m22 > MIN_SPEED)
+    radius_m22[mask_m22] = (speed_m22[mask_m22]**2) / acc_norm_m22[mask_m22]
+
+    # Retorno completo
+    return pd.DataFrame({
+        'playId': group['playId'].values,
+        # M1
+        'speed_m1': s_gauss, 'acc_total_m1': acc_total_m1, 'acc_tang_m1': acc_tang_m1, 'acc_norm_m1': acc_norm_m1, 'radius_m1': radius_m1,
+        # M2.1
+        'speed_m2_1': speed_m21, 'acc_total_m2_1': acc_total_m21, 'acc_tang_m2_1': acc_tang_m21, 'acc_norm_m2_1': acc_norm_m21, 'radius_m2_1': radius_m21,
+        # M2.2
+        'speed_m2_2': speed_m22, 'acc_total_m2_2': acc_total_m22, 'acc_tang_m2_2': acc_tang_m22, 'acc_norm_m2_2': acc_norm_m22, 'radius_m2_2': radius_m22
+    })
+
+# -----------------------------------------------------------------------------
+# 4. PROCESAMIENTO
+# -----------------------------------------------------------------------------
+results = []
+if 'playId' in df_nfl.columns:
+    for _, group in df_nfl.groupby('playId'):
+        res = compute_nfl_kinematics_v3(group)
+        if res is not None: results.append(res)
+else:
+    df_nfl['playId'] = 1
+    res = compute_nfl_kinematics_v3(df_nfl)
+    if res is not None: results.append(res)
+
+if not results:
+    raise ValueError("No se generaron datos procesados.")
+
+df_processed = pd.concat(results, ignore_index=True)
+
+# -----------------------------------------------------------------------------
+# 5. PREPARACIÓN VISUAL (3 MÉTODOS)
+# -----------------------------------------------------------------------------
+methods_map = {
+    '1. M1: Híbrido (Sensor)': {
+        's': 'speed_m1', 'r': 'radius_m1', 
+        'acc': {'acc_total_m1': 'Total', 'acc_tang_m1': 'Tangencial', 'acc_norm_m1': 'Normal'}
+    },
+    '2. M2.1: Pitagórico (Media Móvil)': {
+        's': 'speed_m2_1', 'r': 'radius_m2_1', 
+        'acc': {'acc_total_m2_1': 'Total', 'acc_tang_m2_1': 'Tangencial', 'acc_norm_m2_1': 'Normal'}
+    },
+    '3. M2.2: Pitagórico (Gaussiano)': {
+        's': 'speed_m2_2', 'r': 'radius_m2_2', 
+        'acc': {'acc_total_m2_2': 'Total', 'acc_tang_m2_2': 'Tangencial', 'acc_norm_m2_2': 'Normal'}
+    }
+}
+
+data_viz = []
+for m_name, cols in methods_map.items():
+    v_kmh = df_processed[cols['s']] * 3.6
+    r_val = df_processed[cols['r']]
+    
+    for col_a, label in cols['acc'].items():
+        if col_a not in df_processed.columns: continue
+        
+        temp = pd.DataFrame({
+            'Velocidad (km/h)': v_kmh,
+            'Aceleración': df_processed[col_a],
+            'Radio (m)': r_val,
+            'Tipo': label,
+            'Método': m_name
+        })
+        # Filtros visuales
+        mask_vis = (temp['Velocidad (km/h)'] > 3) & (temp['Radio (m)'] < 200)
+        data_viz.append(temp[mask_vis])
+
+df_plot = pd.concat(data_viz)
+
+# Downsampling
+if len(df_plot) > 50000: 
+    df_plot = df_plot.sample(50000, random_state=42)
+
+# -----------------------------------------------------------------------------
+# 6. GRÁFICO FINAL (3x3)
+# -----------------------------------------------------------------------------
+sns.set_style("whitegrid")
+
+orden_columnas = ['Tangencial', 'Total', 'Normal']
+orden_filas = ['1. M1: Híbrido (Sensor)', '2. M2.1: Pitagórico (Media Móvil)', '3. M2.2: Pitagórico (Gaussiano)']
+
+g = sns.relplot(
+    data=df_plot, 
+    x="Velocidad (km/h)", 
+    y="Aceleración", 
+    hue="Radio (m)",
+    
+    col="Tipo", 
+    col_order=orden_columnas,  
+    
+    row="Método", 
+    row_order=orden_filas,
+
+    palette="viridis_r",
+    hue_norm=colors.LogNorm(vmin=1, vmax=30), 
+    kind="scatter",
+    height=3.0, 
+    aspect=1.2, 
+    alpha=0.6, 
+    s=15,
+    facet_kws={'sharex': True, 'sharey': False}
+)
+
+g.set_titles(col_template="{col_name}", row_template="{row_name}", size=11, fontweight='bold')
+g.set_axis_labels("Velocidad (km/h)", "Aceleración (m/s²)")
+g.fig.subplots_adjust(top=0.9)
+g.fig.suptitle('Datos NFL: Comparativa de métodos', fontsize=16)
+
+# Ajuste de límites (Zoom a la zona de interés humana)
+g.set(xlim=(0, 40), ylim=(0, 15))
+
+plt.show()
+```
+
+### Comprobaciones de diferencias
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+
+# 1. Configuración de la Figura (3 Filas x 2 Columnas)
+fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+plt.subplots_adjust(hspace=0.5, wspace=0.3)
+
+# Definimos los métodos a iterar para no repetir código
+check_config = [
+    {
+        'name': 'M1: Híbrido (Sensor)', 
+        'suffix': '_m1', 
+        'color': 'blue', 
+        'row': 0
+    },
+    {
+        'name': 'M2.1: Pitagórico (Media Móvil)', 
+        'suffix': '_m2_1', 
+        'color': '#dd8452', # Naranja
+        'row': 1
+    },
+    {
+        'name': 'M2.2: Pitagórico (Gaussiano)', 
+        'suffix': '_m2_2', 
+        'color': 'green', 
+        'row': 2
+    }
+]
+
+df_check = df_full.copy()
+
+# 2. Bucle de Generación de Gráficos
+for config in check_config:
+    suffix = config['suffix']
+    row = config['row']
+    color = config['color']
+    name = config['name']
+    
+    # Nombres de columnas dinámicos
+    col_total = f'acc_total{suffix}'
+    col_tang  = f'acc_tang{suffix}'
+    col_norm  = f'acc_norm{suffix}'
+    
+    # Verificar existencia (por seguridad)
+    if col_total not in df_check.columns: continue
+
+    # --- CÁLCULO DEL RESIDUO ---
+    # Reconstruimos la total teórica sumando componentes: sqrt(Tan^2 + Norm^2)
+    acc_reconstructed = np.sqrt(df_check[col_tang]**2 + df_check[col_norm]**2)
+    
+    # Diferencia: (Total Almacenada - Total Reconstruida)
+    # Nota: Debería ser 0 si la matemática es consistente
+    residuo = df_check[col_total] - acc_reconstructed
+    
+    # Limpiamos NaNs para estadísticas (especialmente en M2.2 que tiene filtros)
+    residuo_clean = residuo.dropna()
+    mean_err = residuo_clean.mean()
+    std_err = residuo_clean.std()
+
+    # --- GRÁFICO A (Izquierda): Histograma de Errores ---
+    ax_hist = axes[row, 0]
+    sns.histplot(residuo_clean, kde=False, bins=50, ax=ax_hist, color=color, alpha=0.7)
+    
+    ax_hist.set_title(f'{name}: Distribución del Residuo')
+    ax_hist.set_xlabel('Diferencia (m/s²)')
+    ax_hist.set_ylabel('Frecuencia')
+    
+    # Nota estadística en el gráfico
+    stats_text = f"Media Err: {mean_err:.2e}\nStd Err: {std_err:.2e}"
+    ax_hist.text(0.95, 0.9, stats_text, transform=ax_hist.transAxes, ha='right', 
+                 fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
+
+    # --- GRÁFICO B (Derecha): Correlación Perfecta ---
+    ax_scat = axes[row, 1]
+    
+    # Scatterplot (Usamos sample para no saturar si hay muchos datos)
+    plot_data = pd.DataFrame({'Real': df_check[col_total], 'Reconstructed': acc_reconstructed}).dropna()
+    if len(plot_data) > 10000: plot_data = plot_data.sample(10000)
+    
+    sns.scatterplot(x='Real', y='Reconstructed', data=plot_data,
+                    ax=ax_scat, s=10, color=color, alpha=0.2)
+    
+    # Línea de identidad (Referencia perfecta)
+    if not plot_data.empty:
+        min_val = min(plot_data['Real'].min(), plot_data['Reconstructed'].min())
+        max_val = max(plot_data['Real'].max(), plot_data['Reconstructed'].max())
+        ax_scat.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=1.5, label='Identidad (y=x)')
+    
+    ax_scat.set_title(f'{name}: Consistencia Pitagórica')
+    ax_scat.set_xlabel('Aceleración Total (Vectorial)')
+    ax_scat.set_ylabel('sqrt(Tang² + Norm²)')
+    ax_scat.legend(loc='upper left', fontsize=8)
+    ax_scat.grid(True, linestyle='--', alpha=0.5)
+
+# Título Global
+fig.suptitle("Validación Matemática v8.3: ¿Suman 0 los residuos vectoriales?", fontsize=16, y=0.92)
+plt.show()
+```
+
+### Diagramas correlación entre métodos por variable
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+
+# -----------------------------------------------------------------------------
+# 1. Configuración de la Matriz
+# -----------------------------------------------------------------------------
+variables_config = [
+    ('speed',     'Velocidad (m/s)',         None),
+    ('acc_tang',  'Acel. Tangencial (m/s²)', (-10, 10)),
+    ('acc_norm',  'Acel. Normal (m/s²)',     (0, 15)),
+    ('acc_total', 'Acel. Total (m/s²)',      (0, 15)),
+    ('radius',    'Radio de Giro (m)',       (0, 60))
+]
+
+method_pairs = [
+    ('_m1',   '_m2_1', 'M1 vs M2.1 (Media móvil)'),
+    ('_m1',   '_m2_2', 'M1 vs M2.2 (Gaussiano)'),
+    ('_m2_1', '_m2_2', 'M2.1 vs M2.2 (Efecto Filtro)')
+]
+
+# -----------------------------------------------------------------------------
+# 2. Generación del Gráfico Optimizada
+# -----------------------------------------------------------------------------
+df_comp = df_full.copy().replace([np.inf, -np.inf], np.nan)
+
+n_rows = len(variables_config)
+n_cols = len(method_pairs)
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 20))
+
+print(f"📉 Generando matriz {n_rows}x{n_cols} con optimización de rendimiento...")
+
+for row_idx, (var_prefix, var_label, limits) in enumerate(variables_config):
+    for col_idx, (suffix_x, suffix_y, pair_label) in enumerate(method_pairs):
+        
+        ax = axes[row_idx, col_idx]
+        col_x = f"{var_prefix}{suffix_x}"
+        col_y = f"{var_prefix}{suffix_y}"
+        
+        if col_x not in df_comp.columns or col_y not in df_comp.columns:
+            ax.text(0.5, 0.5, "Datos no encontrados", ha='center')
+            continue
+            
+        subset = df_comp[[col_x, col_y]].dropna()
+        
+        if limits:
+            min_v, max_v = limits
+            subset = subset[(subset[col_x] >= min_v) & (subset[col_x] <= max_v) &
+                            (subset[col_y] >= min_v) & (subset[col_y] <= max_v)]
+        
+        # --- OPTIMIZACIÓN 1: DOWNSAMPLING VISUAL ---
+        # Si hay más de 50k puntos, cogemos una muestra aleatoria SOLO para pintar.
+        # Las estadísticas se calculan sobre TODOS los datos.
+        if len(subset) > 50000:
+            subset_plot = subset.sample(n=50000, random_state=42)
+        else:
+            subset_plot = subset
+
+        # Datos para pintar (ligeros)
+        x_plot = subset_plot[col_x]
+        y_plot = subset_plot[col_y]
+        
+        # Datos completos para estadísticas (precisos)
+        x_full = subset[col_x]
+        y_full = subset[col_y]
+        
+        if len(x_full) < 2:
+            ax.text(0.5, 0.5, "N < 2", ha='center')
+            continue
+
+        # --- Métricas (sobre datos completos) ---
+        r = x_full.corr(y_full)
+        rmse = np.sqrt(mean_squared_error(x_full, y_full))
+        
+        # --- Plot (sobre muestra visual + OPTIMIZACIÓN 2: ci=None) ---
+        sns.regplot(
+            x=x_plot, y=y_plot, ax=ax,
+            ci=None,  # <--- CRÍTICO: Desactiva el cálculo pesado de intervalos de confianza
+            scatter_kws={'s': 3, 'alpha': 0.1, 'color': '#1f77b4', 'rasterized': True}, # Rasterized acelera el guardado
+            line_kws={'color': '#ff7f0e', 'linewidth': 1.5}
+        )
+        
+        # Línea de Identidad
+        min_val, max_val = min(x_full.min(), y_full.min()), max(x_full.max(), y_full.max())
+        ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=1, alpha=0.5)
+        
+        # Etiquetas
+        if row_idx == 0:
+            ax.set_title(pair_label, fontsize=12, fontweight='bold', pad=10)
+        
+        if col_idx == 0:
+            ax.set_ylabel(f"{var_label}\n({suffix_y.replace('_','')})", fontsize=10, fontweight='bold')
+        else:
+            ax.set_ylabel("")
+            
+        if row_idx == n_rows - 1:
+            ax.set_xlabel(f"{suffix_x.replace('_','')}", fontsize=10, fontweight='bold')
+        else:
+            ax.set_xlabel("")
+
+        if limits:
+            ax.set_xlim(limits)
+            ax.set_ylim(limits)
+            
+        ax.grid(True, linestyle=':', alpha=0.4)
+        
+        stats_text = f"r={r:.2f}\nRMSE={rmse:.2f}"
+        ax.text(0.95, 0.05, stats_text, transform=ax.transAxes, 
+                fontsize=9, fontweight='bold', ha='right', va='bottom',
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.8))
+
+plt.suptitle(f"Matriz de Validación Cruzada (n={len(df_comp)})", fontsize=16, y=0.92)
+plt.tight_layout()
+plt.show()
+
+```
+
+## Inspección visual de las diferencias en un tramo específico
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Configuración del Tramo a Visualizar
+# -----------------------------------------------------------------------------
+# Elige dónde empieza la ventana de 5000 datos. 
+# Si tienes varias sesiones unidas, intenta buscar un tramo con movimiento.
+START_IDX = 40000 
+WINDOW_LEN = 500
+
+# Extraer el subset
+if len(df_full) < (START_IDX + WINDOW_LEN):
+    print(f"⚠️ Aviso: El DataFrame es corto. Se graficarán los últimos {len(df_full)} datos.")
+    df_zoom = df_full.iloc[-WINDOW_LEN:].copy().reset_index(drop=True)
+else:
+    df_zoom = df_full.iloc[START_IDX : START_IDX + WINDOW_LEN].copy().reset_index(drop=True)
+
+# Crear un eje X relativo (segundos) si tenemos tiempo, si no, por frames
+if 'time' in df_zoom.columns:
+    df_zoom['x_axis'] = df_zoom['time'] - df_zoom['time'].iloc[0]
+    xlabel = "Tiempo (s)"
+else:
+    df_zoom['x_axis'] = df_zoom.index
+    xlabel = "Observaciones (Frames)"
+
+# -----------------------------------------------------------------------------
+# 2. Configuración de Variables y Estilos
+# -----------------------------------------------------------------------------
+# Definimos qué columnas pintar en cada subplot
+vars_to_plot = [
+    {
+        'title': 'Velocidad (km/h)', 'ylim': None,
+        'cols': [
+            ('speed_m1',   'M1',   'red'),
+            ('speed_m2_1', 'M2.1', 'blue'),
+            ('speed_m2_2', 'M2.2', 'green')
+        ],
+        'factor': 3.6
+    },
+    {
+        'title': 'Aceleración Tangencial (m/s²)', 'ylim': (-10, 10),
+        'cols': [
+            ('acc_tang_m1',   'M1',   'red'),
+            ('acc_tang_m2_1', 'M2.1', 'blue'),
+            ('acc_tang_m2_2', 'M2.2', 'green')
+        ],
+        'factor': 1.0
+    },
+    {
+        'title': 'Aceleración Normal (m/s²)', 'ylim': (0, 10),
+        'cols': [
+            ('acc_norm_m1',   'M1',   'red'),
+            ('acc_norm_m2_1', 'M2.1', 'blue'),
+            ('acc_norm_m2_2', 'M2.2', 'green')
+        ],
+        'factor': 1.0
+    },
+    {
+        'title': 'Aceleración Total (m/s²)', 'ylim': (0, 15),
+        'cols': [
+            ('acc_total_m1',   'M1',   'red'),
+            ('acc_total_m2_1', 'M2.1', 'blue'),
+            ('acc_total_m2_2', 'M2.2', 'green')
+        ],
+        'factor': 1.0
+    },
+    {
+        'title': 'Radio de Giro (m)', 'ylim': (0, 60),
+        'cols': [
+            ('radius_m1',   'M1',   'red'),
+            ('radius_m2_1', 'M2.1', 'blue'),
+            ('radius_m2_2', 'M2.2', 'green')
+        ],
+        'factor': 1.0
+    }
+]
+
+# -----------------------------------------------------------------------------
+# 3. Generación del Gráfico
+# -----------------------------------------------------------------------------
+fig, axes = plt.subplots(5, 1, figsize=(14, 18), sharex=True)
+plt.subplots_adjust(hspace=0.2)
+
+print(f"📈 Graficando tramo de {WINDOW_LEN} observaciones...")
+
+for i, config in enumerate(vars_to_plot):
+    ax = axes[i]
+    
+    # Iterar por los 3 métodos (M1, M2.1, M2.2)
+    for col_name, label, color in config['cols']:
+        if col_name not in df_zoom.columns: continue
+        
+        # Datos
+        y_data = df_zoom[col_name] * config['factor']
+        
+        # Estilo diferenciado
+        if label == 'M2.1': 
+            # M2.1 (Media móvil) lo ponemos fino y transparente para que no tape todo
+            ax.plot(df_zoom['x_axis'], y_data, label=label, 
+                    color=color, linewidth=0.8, alpha=0.5)
+        elif label == 'M1':
+            # M1 (Ref) punteado o sólido grueso detrás
+            ax.plot(df_zoom['x_axis'], y_data, label=label, 
+                    color=color, linewidth=1.5, alpha=0.6, linestyle='--')
+        else:
+            # M2.2 (Gaussiano) sólido y visible
+            ax.plot(df_zoom['x_axis'], y_data, label=label, 
+                    color=color, linewidth=2.0, alpha=0.9)
+
+    ax.set_ylabel(config['title'], fontweight='bold')
+    ax.grid(True, linestyle=':', alpha=0.5)
+    
+    # Límites Y específicos (vital para Radius y Acc)
+    if config['ylim']:
+        ax.set_ylim(config['ylim'])
+        
+    # Leyenda solo en el primero para no ensuciar
+    if i == 0:
+        ax.legend(loc='upper right', frameon=True, ncol=3)
+
+axes[-1].set_xlabel(xlabel, fontweight='bold', fontsize=12)
+fig.suptitle(f"Análisis Temporal: Comportamiento de Métodos (n={WINDOW_LEN})", fontsize=16, y=0.92)
+
+plt.show()
+```
+
+## Superficie 3D y Perfiles AS (Plotly)
+
+```{python}
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from scipy.ndimage import gaussian_filter
+from sklearn.linear_model import LinearRegression
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 0. CONFIGURACIÓN Y MAPEO DE DATOS (Adaptación v8.3)
+# =========================================================
+METHOD_SUFFIX = '_m1'  # '_m1', '_m2_1', '_m2_2'
+ACC_TYPE = 'tang'        # 'tang' (Propulsión)
+
+print(f"📊 Generando Análisis AS Avanzado para: {METHOD_SUFFIX} ({ACC_TYPE})")
+
+# Preparamos el DataFrame base 'df_result' que espera tu código
+df_result = df_full.copy()
+
+# 1. Mapeo dinámico de columnas v8.3 a nombres genéricos
+col_speed = f"speed{METHOD_SUFFIX}"
+col_rad   = f"radius{METHOD_SUFFIX}"
+col_acc   = f"acc_{ACC_TYPE}{METHOD_SUFFIX}"
+
+df_result['speed_kmh'] = df_result[col_speed] * 3.6
+df_result['R_kappa']   = df_result[col_rad]
+df_result['acc']       = df_result[col_acc]
+
+# 2. Filtros de limpieza
+# Solo aceleración positiva (propulsión) y datos válidos
+df_result = df_result[
+    (df_result['acc'] > 0) & 
+    (np.isfinite(df_result['speed_kmh'])) & 
+    (np.isfinite(df_result['R_kappa'])) & 
+    (np.isfinite(df_result['acc']))
+]
+
+# 3. Recorte de radios (Zoom a la zona de interés 0-60m)
+df_result = df_result[(df_result["R_kappa"] > 0) & (df_result["R_kappa"] <= 60)]
+
+# =========================================================
+# 1) Superficie 3D “techo” + puntos coloreados por radio
+# =========================================================
+
+# Copia para trabajar la superficie
+df_surface = df_result.copy()
+
+# Bins en velocidad y radio
+n_bins_speed = 20
+n_bins_R     = 20
+
+speed_bins = np.linspace(df_surface["speed_kmh"].min(),
+                         df_surface["speed_kmh"].max(),
+                         n_bins_speed + 1)
+
+R_bins = np.linspace(df_surface["R_kappa"].min(),
+                     df_surface["R_kappa"].max(),
+                     n_bins_R + 1)
+
+df_surface["speed_bin"] = pd.cut(df_surface["speed_kmh"], bins=speed_bins, include_lowest=True)
+df_surface["R_bin"]     = pd.cut(df_surface["R_kappa"], bins=R_bins, include_lowest=True)
+
+# “Techo” de aceleración por celda (percentil 98)
+tabla = (
+    df_surface.groupby(["speed_bin", "R_bin"], observed=False)["acc"]
+              .quantile(0.98)
+              .unstack()
+)
+
+# Centros de cada bin
+speed_centers = np.array([interval.mid for interval in tabla.index])
+R_centers     = np.array([interval.mid for interval in tabla.columns])
+
+# Matriz Z con relleno de huecos e interpolación
+Z_raw = tabla.values
+Z_df = pd.DataFrame(Z_raw, index=speed_centers, columns=R_centers)
+Z_filled = (
+    Z_df.interpolate(axis=0, limit_direction="both")
+        .interpolate(axis=1, limit_direction="both")
+        .values
+)
+
+# Suavizado ligero 2D
+Z_suave = gaussian_filter(Z_filled, sigma=1)
+
+# Datos reales para scatter (Downsampling para rendimiento si hay muchos datos)
+if len(df_surface) > 10000:
+    df_scatter_plot = df_surface.sample(10000, random_state=42)
+else:
+    df_scatter_plot = df_surface
+
+vx  = df_scatter_plot["speed_kmh"].values
+R   = df_scatter_plot["R_kappa"].values
+acc = df_scatter_plot["acc"].values
+
+# Superficie (sin barra de color; la barra será del radio)
+surface = go.Surface(
+    x=speed_centers,
+    y=R_centers,
+    z=Z_suave.T,          # z shape = (len(y), len(x))
+    colorscale="Viridis", # <--- Tu estética
+    showscale=False,
+    opacity=0.8,
+    name="Techo P95"
+)
+
+# Puntos coloreados por radio de curvatura
+scatter = go.Scatter3d(
+    x=vx,
+    y=R,
+    z=acc,
+    mode="markers",
+    marker=dict(
+        size=3,
+        color=R,
+        colorscale="Plasma", # <--- Tu estética
+        cmin=0,
+        cmax=60,
+        colorbar=dict(
+            title="Radio de curva (m)",
+            x=1.05
+        ),
+        opacity=0.45
+    ),
+    name="Datos reales",
+    showlegend=False
+)
+
+# Figura base 3D
+fig = go.Figure(data=[surface, scatter])
+
+# =========================================================
+# 2) Función para perfiles AS in-situ
+# =========================================================
+
+def compute_AS_profile_in_situ(df, speed_col="speed_kmh", acc_col="acc", v_min_ms=3.0, dv_ms=0.2, topN=2):
+    """
+    Calcula un perfil AS (aceleración-velocidad) tipo in-situ.
+    """
+    df = df.copy()
+    # Velocidad en m/s
+    df["speed_ms"] = df[speed_col] / 3.6
+
+    # Filtro básico in-situ: solo acc>0 y v >= v_min_ms
+    df = df[(df[acc_col] > 0) & (df["speed_ms"] >= v_min_ms)]
+    if len(df) < 10: return None, None
+
+    # Bins de velocidad en m/s
+    v_max = df["speed_ms"].max()
+    if pd.isna(v_max): return None, None
+    
+    speed_bins = np.arange(v_min_ms, v_max + dv_ms, dv_ms)
+    df["speed_bin"] = pd.cut(df["speed_ms"], bins=speed_bins, include_lowest=True)
+
+    # En cada bin, topN aceleraciones
+    df_bins = (
+        df.sort_values(acc_col, ascending=False)
+          .groupby("speed_bin", observed=False)
+          .head(topN)
+          .dropna(subset=["speed_bin"])
+    )
+
+    if df_bins["speed_bin"].nunique() < 2: return None, None
+
+    df_bins = df_bins.copy()
+    df_bins["v_rep_ms"] = df_bins["speed_bin"].apply(
+        lambda inter: float(inter.mid) if pd.notna(inter) else np.nan
+    ).astype(float)
+    df_bins["v_rep_kmh"] = df_bins["v_rep_ms"] * 3.6
+    df_bins["acc_used"]  = df_bins[acc_col].astype(float)
+
+    # Quitar posibles NaN
+    df_bins = df_bins.dropna(subset=["v_rep_ms", "acc_used"])
+    if len(df_bins) < 2: return None, None
+
+    X = df_bins[["v_rep_ms"]].values
+    y = df_bins["acc_used"].values
+
+    lin = LinearRegression().fit(X, y)
+
+    A0    = float(lin.intercept_)
+    slope = float(lin.coef_[0])
+    S0_ms  = -A0 / slope if slope != 0 else np.nan
+    S0_kmh = S0_ms * 3.6 if np.isfinite(S0_ms) else np.nan
+    R2    = lin.score(X, y)
+
+    params = dict(A0=A0, slope=slope, S0_ms=S0_ms, S0_kmh=S0_kmh, R2=R2)
+    return params, df_bins[["v_rep_ms", "v_rep_kmh", "acc_used"]]
+
+# =========================================================
+# 3) Perfiles AS por bandas de radio (0–5, 5–10, ..., 55–60)
+# =========================================================
+
+df_AS = df_result.copy()
+step = 10
+R_max = 60.0
+R_edges = np.arange(0, R_max + step, step) 
+
+R_labels = [f"{int(R_edges[i])}–{int(R_edges[i+1])} m" for i in range(len(R_edges) - 1)]
+
+df_AS["R_band"] = pd.cut(df_AS["R_kappa"], bins=R_edges, labels=R_labels, right=False, include_lowest=True)
+
+profiles = []
+pts_list = []
+
+for band in R_labels:
+    sub = df_AS[df_AS["R_band"] == band]
+    if sub.empty: continue
+
+    params, df_pts = compute_AS_profile_in_situ(sub, speed_col="speed_kmh", acc_col="acc")
+    if params is None: continue
+
+    params["R_band"] = band
+    profiles.append(params)
+    
+    df_pts["R_band"] = band
+    pts_list.append(df_pts)
+
+profiles_df = pd.DataFrame(profiles)
+if pts_list:
+    pts_df = pd.concat(pts_list, ignore_index=True)
+else:
+    pts_df = pd.DataFrame()
+
+# =========================================================
+# 4) Rectas AS 2D (Validación Visual)
+# =========================================================
+if not profiles_df.empty:
+    sns.set(style="whitegrid")
+    plt.figure(figsize=(10, 6))
+    palette = sns.color_palette("viridis", len(profiles_df))
+
+    for color, (_, row) in zip(palette, profiles_df.iterrows()):
+        band   = row["R_band"]
+        A0     = row["A0"]
+        slope  = row["slope"]
+        S0_kmh = row["S0_kmh"]
+
+        sub_pts = pts_df[pts_df["R_band"] == band]
+        v_max_ms_plot = sub_pts["v_rep_ms"].max() if not sub_pts.empty else 0
+        
+        if v_max_ms_plot <= 3.0: continue
+
+        v_grid_ms  = np.linspace(3.0, v_max_ms_plot, 50)
+        v_grid_kmh = v_grid_ms * 3.6
+        a_pred     = A0 + slope * v_grid_ms
+
+        plt.scatter(sub_pts["v_rep_kmh"], sub_pts["acc_used"], s=20, alpha=0.5, color=color)
+        plt.plot(v_grid_kmh, a_pred, color=color, label=f"{band} (S0 ≈ {S0_kmh:.1f})")
+
+    plt.xlabel("Velocidad (km/h)")
+    plt.ylabel("Aceleración (m/s²)")
+    plt.title(f"Perfiles AS in-situ por bandas de Radio ({METHOD_SUFFIX})")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+# =========================================================
+# 5) Añadir las rectas AS al gráfico 3D
+# =========================================================
+
+# Colores para las distintas bandas de radio
+colors_plotly = px.colors.qualitative.Plotly
+R_centers_band = {
+    f"{int(R_edges[i])}–{int(R_edges[i+1])} m": 0.5 * (R_edges[i] + R_edges[i+1])
+    for i in range(len(R_edges) - 1)
+}
+
+if not profiles_df.empty:
+    for i, (_, row) in enumerate(profiles_df.iterrows()):
+        band = row["R_band"]
+        band_str = str(band)
+        if band_str not in R_centers_band: continue
+
+        R_center = R_centers_band[band_str]
+        A0    = row["A0"]
+        slope = row["slope"]
+        
+        sub_pts = pts_df[pts_df["R_band"] == band]
+        v_max_ms = sub_pts["v_rep_ms"].max() if not sub_pts.empty else 0
+        if v_max_ms <= 3.0: continue
+
+        v_ms  = np.linspace(3.0, v_max_ms, 50)
+        v_kmh = v_ms * 3.6
+        a_pred = A0 + slope * v_ms
+
+        color = colors_plotly[i % len(colors_plotly)]
+
+        fig.add_trace(go.Scatter3d(
+            x=v_kmh,
+            y=np.full_like(v_kmh, R_center),
+            z=a_pred,
+            mode="lines",
+            line=dict(color=color, width=6),
+            name=f"AS {band_str}",
+            showlegend=True
+        ))
+
+# Layout final
+fig.update_layout(
+    title=f"<b>Análisis 3D Avanzado ({METHOD_SUFFIX})</b><br>Superficie Viridis + Puntos Plasma + Perfiles AS",
+    scene=dict(
+        xaxis=dict(title="Velocidad (km/h)", autorange="reversed"),
+        yaxis=dict(title="Radio de curva (m)"),
+        zaxis=dict(title="Acc (m/s²)")
+    ),
+    legend=dict(x=0.02, y=0.98, bgcolor="rgba(255,255,255,0.7)"),
+    margin=dict(l=0, r=0, b=0, t=40),
+    height=600
+)
+
+fig.show()
+```
+
+# ANEXO: Comprobaciones
+
+## Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+
+# ---------- Helpers ----------
+def _get_dt_from_time(df, time_col="time", fallback_hz=18):
+    """Estimación robusta de dt."""
+    if time_col in df.columns:
+        t = df[time_col].values.astype(float)
+        dt = np.nanmedian(np.diff(t))
+        if np.isfinite(dt) and dt > 0:
+            return dt
+    return 1.0 / fallback_hz
+
+def rolling_quantile(x, q=0.99):
+    return x.quantile(q)
+
+def safe_corr(a, b):
+    a = pd.Series(a).replace([np.inf, -np.inf], np.nan)
+    b = pd.Series(b).replace([np.inf, -np.inf], np.nan)
+    tmp = pd.concat([a, b], axis=1).dropna()
+    if len(tmp) < 3:
+        return np.nan
+    return tmp.iloc[:,0].corr(tmp.iloc[:,1])
+
+def classify_curve_from_radius(radius, r_small=10, r_large=60):
+    """
+    Etiquetas simples:
+    - 'curva' si R <= r_small
+    - 'recta' si R >= r_large o inf
+    - 'medio' en el resto
+    """
+    r = pd.Series(radius).replace([np.inf, -np.inf], np.nan)
+    out = pd.Series(index=r.index, dtype="object")
+    out[(r <= r_small)] = "curva"
+    out[(r >= r_large) | (r.isna())] = "recta"
+    out[out.isna()] = "medio"
+    return out
+
+```
+
+## 1. Comprobación de sesgo de intención en GPS
+
+```{python}
+def check_intention_bias_gps(df_full, method="m1",
+                             speed_bin_kmh=1.0, min_speed=2.0,
+                             r_small=10, r_large=60):
+    df = df_full.copy()
+
+    # Selección de columnas (ajusta si quieres analizar otro método)
+    v_col = f"speed_{method}" if f"speed_{method}" in df.columns else f"speed{method}"
+    a_dev_col = f"acc_tang_{method}" if f"acc_tang_{method}" in df.columns else f"acc_tang_{method}"
+    r_col = f"radius_{method}" if f"radius_{method}" in df.columns else f"radius{method}"
+
+    # Normalización básica
+    df["v_kmh"] = df[v_col] * 3.6
+    df["curve_class"] = classify_curve_from_radius(df[r_col], r_small=r_small, r_large=r_large)
+
+    # Filtrado velocidad útil
+    df = df[(df["v_kmh"] >= min_speed) & np.isfinite(df["v_kmh"])]
+
+    # Bins de velocidad
+    bins = np.arange(df["v_kmh"].min(), df["v_kmh"].max() + speed_bin_kmh, speed_bin_kmh)
+    df["v_bin"] = pd.cut(df["v_kmh"], bins=bins, include_lowest=True)
+
+    # Métricas: % de frames con acc>0, mediana acc, P95/P99 acc
+    g = (df.groupby(["v_bin", "curve_class"], observed=True)[a_dev_col]
+           .agg(n="count",
+                pct_pos=lambda x: np.mean(x > 0),
+                med="median",
+                p95=lambda x: np.quantile(x, 0.95),
+                p99=lambda x: np.quantile(x, 0.99))
+           .reset_index())
+
+    # Pivot para comparar curva vs recta
+    pivot = g.pivot_table(index="v_bin", columns="curve_class",
+                          values=["n","pct_pos","med","p95","p99"])
+    return g, pivot
+
+# --- Uso ---
+g_int, pivot_int = check_intention_bias_gps(df_full, method="m1") # MODIFICAR AL CAMBIAR DE MÉTODO
+display(pivot_int.tail(15))
+
+```
+
+## 2. Comprobación de conteos por bin para envolvente
+
+```{python}
+def check_bin_counts_for_envelope(df_full, method="m1",
+                                  v_targets=(5, 10,15,20), tol=1,
+                                  r_max=60, r_bin=1.0):
+    df = df_full.copy()
+    v_col = f"speed_{method}" if f"speed_{method}" in df.columns else f"speed{method}"
+    r_col = f"radius_{method}" if f"radius_{method}" in df.columns else f"radius{method}"
+    a_dev_col = "acc"  # tu verdad
+
+    df["v_kmh"] = df[v_col] * 3.6
+    df = df[(df["v_kmh"].notna()) & np.isfinite(df["v_kmh"])]
+
+    out = []
+    r_bins = np.arange(0, r_max + r_bin, r_bin)
+
+    for vt in v_targets:
+        sub = df[df["v_kmh"].between(vt - tol, vt + tol)].copy()
+        sub = sub[(sub[a_dev_col] > 0) & (sub[r_col] > 0) & (sub[r_col] <= r_max)]
+        if len(sub) == 0:
+            continue
+        sub["r_bin"] = pd.cut(sub[r_col], bins=r_bins, include_lowest=True)
+        tmp = sub.groupby("r_bin", observed=True)[a_dev_col].agg(n="count",
+                                                                p90=lambda x: np.quantile(x,0.9),
+                                                                p95=lambda x: np.quantile(x,0.95),
+                                                                p99=lambda x: np.quantile(x,0.99)).reset_index()
+        tmp["v_target"] = vt
+        out.append(tmp)
+
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+# --- Uso ---
+df_counts = check_bin_counts_for_envelope(df_full, method="m1")
+df_counts.sort_values(["v_target","n"]).head(20)
+
+```
+
+### Tabla sesgo 2
+```{python}
+import pandas as pd
+import numpy as np
+
+def display_envelope_matrix(df_counts, r_max_display=60):
+    """
+    Transforma la salida larga en una matriz Radio vs Velocidad.
+    Ideal para detectar huecos en la cobertura de datos.
+    """
+    if df_counts.empty:
+        return "No Data"
+
+    df = df_counts.copy()
+    
+    # 1. Extraer centro del bin de forma segura
+    def get_mid(x):
+        return x.mid if hasattr(x, "mid") else x
+    df['r_center'] = df['r_bin'].apply(get_mid).astype(float)
+    
+    # 2. Filtrar para visualización
+    df = df[df['r_center'] <= r_max_display]
+
+    # 3. Pivotar: Index=Radio, Col=Velocidad, Val=n
+    # Rellenamos con 0 donde no hay datos para que el heatmap no tenga agujeros blancos
+    matrix = df.pivot_table(index="r_center", columns="v_target", values="n", fill_value=0)
+    
+    # Ordenar índice (Radios)
+    matrix = matrix.sort_index()
+
+    # 4. Estilizar
+    # Usamos 'YlGnBu' (Amarillo-Verde-Azul) o 'Blues'. 
+    # Los 0 se pueden poner en gris claro para indicar "sin datos".
+    return (matrix.style
+        .background_gradient(cmap='YlGnBu', axis=None) # Axis=None aplica el color a TODA la tabla
+        .format("{:.0f}")                              # Sin decimales para conteos
+        .highlight_null(color='lightgray')
+        .set_caption("<b>Matriz de Cobertura (Muestras 'n' por Radio y Velocidad)</b>")
+        .set_table_styles([
+            {'selector': 'th', 'props': [('text-align', 'center'), ('background-color', '#f0f0f0')]},
+            {'selector': 'caption', 'props': [('font-size', '14px'), ('color', '#333')]}
+        ])
+    )
+
+# --- USO ---
+# df_counts = check_bin_counts_for_envelope(df_full, ...) # Tu función
+display_envelope_matrix(df_counts)
+```
+
+### Tabla 2
+
+```{python}
+import pandas as pd
+import numpy as np
+import dataframe_image as dfi
+
+def export_compact_grid_table(df_counts, filename="tabla_compacta.png"):
+    """
+    Genera una tabla reducida buscando SOLO los cruces exactos de:
+    - Velocidades: 10, 15, 20... (cada 5)
+    - Radios: 10, 20, 30, 40, 50, 60 (cada 10)
+    
+    Y fuerza la exportación ignorando el límite de filas.
+    """
+    df = df_counts.copy()
+    
+    # 1. Limpieza de datos (Centro del bin)
+    def get_mid(x): return x.mid if hasattr(x, "mid") else x
+    df['r_center'] = df['r_bin'].apply(get_mid).astype(float)
+    
+    # 2. DEFINIR EL GRID ESTRICTO (Objetivos)
+    # Solo queremos ver estas velocidades y estos radios
+    target_velocities = [v for v in sorted(df['v_target'].unique()) if v % 5 == 0]
+    target_radii = [5, 30, 60]
+    
+    indices_to_keep = []
+    
+    # 3. BUSCAR EL MEJOR CANDIDATO PARA CADA PUNTO DEL GRID
+    for v in target_velocities:
+        sub_v = df[df['v_target'] == v]
+        
+        for r in target_radii:
+            # Buscamos el bin más cercano al radio objetivo (tolerancia 2m)
+            matches = sub_v[np.abs(sub_v['r_center'] - r) <= 2.0]
+            
+            if not matches.empty:
+                # Si hay coincidencia, cogemos la que tenga más muestras (la más fiable)
+                best = matches.loc[matches['n'].idxmax()]
+                indices_to_keep.append(best.name)
+    
+    # 4. CREAR DATAFRAME REDUCIDO
+    if not indices_to_keep:
+        print("⚠️ No se encontraron datos para el grid especificado.")
+        return
+        
+    df_small = df.loc[indices_to_keep].sort_values(['v_target', 'r_center']).copy()
+    
+    # Seleccionar y renombrar columnas
+    cols = ['v_target', 'r_center', 'n', 'p95', 'p99']
+    df_view = df_small[cols].copy()
+    df_view.columns = ['Vel (km/h)', 'Radio (m)', 'N', 'P95', 'P99']
+
+    # 5. ESTILIZAR
+    styled = (df_view.style
+        .hide(axis="index")
+        .format({
+            'Radio (m)': '{:.0f}',
+            'P95': '{:.2f}',
+            'P99': '{:.2f}',
+            'N': '{:.0f}'
+        })
+        .bar(subset=['N'], color='#5fba7d', vmin=0, vmax=df['n'].quantile(0.95))
+        .background_gradient(subset=['P95'], cmap='Reds')
+        .set_caption("Resumen Compacto (Grid 5km/h x 10m)")
+        .set_table_styles([
+            {'selector': 'th', 'props': [('background-color', '#333'), ('color', 'white'), ('text-align', 'center')]},
+            {'selector': 'td', 'props': [('text-align', 'center'), ('padding', '5px')]}
+        ])
+    )
+    
+    # 6. EXPORTAR CON EL FIX DEL ERROR (max_rows=-1)
+    print(f"Generando tabla con {len(df_view)} filas...")
+    try:
+        # AQUÍ ESTÁ LA SOLUCIÓN AL ERROR: max_rows=-1
+        dfi.export(styled, filename, dpi=300, max_rows=-1)
+        print(f"✅ Imagen guardada: {filename}")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        
+    return styled
+
+# --- EJECUCIÓN ---
+# Esto generará una tabla pequeña (aprox 18 filas) y forzará la exportación
+tabla_final = export_compact_grid_table(df_counts, "tabla_compacta.png")
+display(tabla_final)
+```
+
+### Visualización sesgo 2
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+
+# =============================================================================
+# CONFIGURACIÓN DE ESTILO
+# =============================================================================
+sns.set_theme(style="whitegrid", context="paper")
+plt.rcParams.update({
+    'figure.dpi': 150,
+    'font.family': 'sans-serif',
+    'axes.titleweight': 'bold',
+    'axes.edgecolor': '#333333',
+    'grid.alpha': 0.3,
+    'legend.frameon': True
+})
+
+def plot_envelope_counts_paper(df_counts, n_min=80, r_max=60):
+    """
+    Visualiza la densidad de muestras. 
+    CORRECCIÓN: Fuerza la conversión a float para evitar error 'dtype=category'.
+    """
+    if df_counts.empty:
+        print("⚠ El DataFrame de conteos está vacío.")
+        return
+
+    # 1. Preparar datos
+    dfc = df_counts.copy()
+    
+    # --- FIX DEL ERROR ---
+    # Función segura para extraer el centro del intervalo
+    def get_center_safe(x):
+        if hasattr(x, "mid"):
+            return x.mid
+        # Si por alguna razón x ya es numérico, lo devolvemos
+        if isinstance(x, (int, float)):
+            return x
+        return np.nan
+
+    # Aplicamos y convertimos explícitamente a float
+    dfc["r_center"] = dfc["r_bin"].apply(get_center_safe).astype(float)
+    
+    # Ahora el filtro ya no fallará porque comparamos float <= int
+    dfc = dfc[dfc["r_center"] <= r_max]
+
+    # 2. Configuración de la figura
+    v_targets = sorted(dfc["v_target"].unique())
+    n_plots = len(v_targets)
+    palette = {10: '#4C72B0', 15: '#DD8452', 20: '#55A868'}
+    
+    fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), sharey=True, sharex=True)
+    if n_plots == 1: axes = [axes]
+
+    # 3. Generación de gráficos
+    for i, vt in enumerate(v_targets):
+        ax = axes[i]
+        sub = dfc[dfc["v_target"] == vt]
+        
+        if len(sub) == 0:
+            continue
+            
+        valid = sub[sub["n"] >= n_min]
+        invalid = sub[sub["n"] < n_min]
+        
+        color = palette.get(vt, '#333333')
+        
+        # A) Insuficientes
+        if not invalid.empty:
+            ax.scatter(invalid["r_center"], invalid["n"], marker="x", color="gray", 
+                       s=30, alpha=0.5, label=f"Insuficiente (<{n_min})")
+            
+        # B) Válidos
+        if not valid.empty:
+            ax.scatter(valid["r_center"], valid["n"], marker="o", color=color, 
+                       s=60, edgecolors='white', linewidth=0.8, alpha=0.9, 
+                       label=f"Válido (≥{n_min})")
+        
+        # C) Línea umbral
+        ax.axhline(n_min, color="#333333", linestyle="--", linewidth=1, alpha=0.5)
+        ax.text(r_max, n_min + (n_min*0.05), f" Min: {n_min}", color="#333333", 
+                fontsize=8, va='bottom', ha='right', fontweight='bold')
+
+        ax.set_title(f"Velocidad ≈ {vt} km/h", color=color)
+        ax.set_xlabel("Radio de Giro (m)")
+        
+        if i == n_plots - 1:
+            ax.legend(loc='upper right', frameon=True, fontsize='small')
+            
+    axes[0].set_ylabel("Número de Muestras (n)")
+    plt.suptitle("Disponibilidad de Datos para Construcción de Envolvente", y=1.02, fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+# --- EJECUCIÓN ---
+# Asegúrate de generar df_counts primero
+df_counts = check_bin_counts_for_envelope(df_full, method="m1")
+plot_envelope_counts_paper(df_counts, n_min=80, r_max=60)
+```
+
+## 3. Comprobación de fuga de aceleración tangencial desde GPS
+
+```{python}
+def check_leakage_gps(df_full, method="m1", hz_fallback=18,
+                      min_speed_kmh=2.0, r_max=60):
+    df = df_full.copy()
+    v_col = f"speed_{method}" if f"speed_{method}" in df.columns else f"speed{method}"
+    r_col = f"radius_{method}" if f"radius_{method}" in df.columns else f"radius{method}"
+    a_dev = "acc"  # verdad dispositivo
+
+    dt = _get_dt_from_time(df, fallback_hz=hz_fallback)
+
+    # speed en m/s
+    v_ms = df[v_col].astype(float).values
+    dvdt = np.gradient(v_ms, dt)  # d|v|/dt (tangencial "cinemática")
+    df["dvdt"] = dvdt
+    df["v_kmh"] = v_ms * 3.6
+
+    # omega implícita desde R: omega = v/R
+    R = df[r_col].replace([np.inf, -np.inf], np.nan).astype(float).values
+    omega = np.zeros_like(v_ms)
+    mask = np.isfinite(R) & (R > 0.1)
+    omega[mask] = v_ms[mask] / R[mask]
+    df["omega_est"] = omega
+    df["a_norm_est"] = (v_ms**2) / np.where(mask, R, np.nan)  # v^2/R
+
+    # filtros razonables
+    df = df[(df["v_kmh"] >= min_speed_kmh) & (df[r_col] > 0) & (df[r_col] <= r_max)]
+
+    # correlaciones globales
+    r1 = safe_corr(df[a_dev], df["dvdt"])
+    r2 = safe_corr(df[a_dev], df["a_norm_est"])
+    r3 = safe_corr(df["dvdt"], df["a_norm_est"])
+
+    summary = {
+        "corr(acc_device, dvdt)": r1,
+        "corr(acc_device, a_norm_est=v^2/R)": r2,
+        "corr(dvdt, a_norm_est)": r3,
+        "dt_used": dt,
+        "n": len(df)
+    }
+
+    return pd.DataFrame([summary]), df
+
+# --- Uso ---
+leak_summary, df_leak = check_leakage_gps(df_full, method="m1")
+print(leak_summary)
+
+```
+
+## 4 Marcado de persistencia en curvas
+
+```{python}
+def add_curve_persistence_flag(df_full, method="m1", hz_fallback=18,
+                               omega_threshold=0.3,  # rad/s (ajusta)
+                               min_duration_s=0.4):
+    """
+    Marca frames como 'curve_persistent' si |omega_est| supera umbral durante una ventana temporal.
+    omega_est se aproxima como v/R.
+    """
+    df = df_full.copy()
+    v_col = f"speed_{method}" if f"speed_{method}" in df.columns else f"speed{method}"
+    r_col = f"radius_{method}" if f"radius_{method}" in df.columns else f"radius{method}"
+
+    dt = _get_dt_from_time(df, fallback_hz=hz_fallback)
+    win = max(1, int(np.round(min_duration_s / dt)))
+
+    v_ms = df[v_col].astype(float).values
+    R = df[r_col].replace([np.inf, -np.inf], np.nan).astype(float).values
+
+    omega = np.zeros_like(v_ms)
+    mask = np.isfinite(R) & (R > 0.1)
+    omega[mask] = v_ms[mask] / R[mask]
+    df["omega_est"] = omega
+
+    # condición puntual
+    is_turn = np.abs(df["omega_est"]) >= omega_threshold
+
+    # persistencia: porcentaje de frames "turn" dentro de una ventana centrada
+    roll = pd.Series(is_turn.astype(int)).rolling(window=win, center=True, min_periods=1).mean()
+    df["curve_persistent"] = roll >= 0.8  # 80% de la ventana en giro
+
+    return df, {"dt": dt, "win_frames": win}
+
+# --- Uso ---
+df_persist, info = add_curve_persistence_flag(df_full, method="m1")
+print(info)
+
+```
+
+## 5) “Recta vs curva” a baja velocidad: ¿de verdad casi todo es curvo?
+
+```{python}
+def check_curve_prevalence_low_speed(df_full, method="m1",
+                                     v_max_kmh=8.0, v_bin_kmh=0.5,
+                                     r_small=10, r_large=60,
+                                     use_persistence=False,
+                                     omega_threshold=0.3, min_duration_s=0.4):
+    if use_persistence:
+        df, _ = add_curve_persistence_flag(df_full, method=method,
+                                           omega_threshold=omega_threshold,
+                                           min_duration_s=min_duration_s)
+        # curva = persistent True, recta = persistent False
+        df["curve_class2"] = np.where(df["curve_persistent"], "curva", "recta")
+    else:
+        df = df_full.copy()
+        r_col = f"radius_{method}" if f"radius_{method}" in df.columns else f"radius{method}"
+        df["curve_class2"] = classify_curve_from_radius(df[r_col], r_small=r_small, r_large=r_large)
+
+    v_col = f"speed_{method}" if f"speed_{method}" in df.columns else f"speed{method}"
+    df["v_kmh"] = df[v_col] * 3.6
+
+    # bins sólo en rango bajo
+    df = df[(df["v_kmh"] >= 0) & (df["v_kmh"] <= v_max_kmh)]
+    bins = np.arange(0, v_max_kmh + v_bin_kmh, v_bin_kmh)
+    df["v_bin"] = pd.cut(df["v_kmh"], bins=bins, include_lowest=True)
+
+    tab = (df.groupby(["v_bin","curve_class2"], observed=True)
+             .size().reset_index(name="n"))
+
+    # proporciones por bin
+    totals = tab.groupby("v_bin")["n"].sum().reset_index(name="n_total")
+    tab = tab.merge(totals, on="v_bin", how="left")
+    tab["pct"] = tab["n"] / tab["n_total"]
+
+    pivot = tab.pivot_table(index="v_bin", columns="curve_class2", values=["n","pct"]).fillna(0)
+    return tab, pivot
+
+# --- Uso ---
+tab_low, pivot_low = check_curve_prevalence_low_speed(df_full, method="m1", v_max_kmh=10, use_persistence=False)
+tab_low_p, pivot_low_p = check_curve_prevalence_low_speed(df_full, method="m1", v_max_kmh=10, use_persistence=True)
+display(pivot_low.tail(20))
+
+```
+
+## Percentiles múltiples con regresión.
+
+```{python}
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# ---------------------------------------------------------------------
+# 0) Anotación de stats de regresión
+# ---------------------------------------------------------------------
+def annotate_stats(data, x, y, **kws):
+    data = data[[x, y]].dropna()
+    if len(data) < 2:
+        return
+    slope, intercept, r_value, p_value, std_err = stats.linregress(data[x], data[y])
+    ax = plt.gca()
+    ax.text(
+        0.95, 0.85, f"m: {slope:.3f}\nr: {r_value:.2f}",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7)
+    )
+
+# ---------------------------------------------------------------------
+# 1) Función: Envolvente por radio para varios percentiles
+# ---------------------------------------------------------------------
+def build_envelopes_multi_percentiles(
+    df_full,
+    method_suffix="_m1",
+    target_speeds=(10, 15, 20),      # km/h
+    tolerance=0.5,                   # km/h
+    percentiles=(0.50, 0.75, 0.90, 0.95, 0.99),
+    bin_width=2.0,                   # m
+    max_radius=60,                   # m
+    min_points_bin=15,               # min obs por bin para usar ese bin
+    propulsive_only=True,            # filtra acc_tang>0
+):
+    # Columnas dinámicas (tu naming)
+    col_speed  = f"speed{method_suffix}"
+    col_radius = f"radius{method_suffix}"
+    col_tang   = f"acc_tang{method_suffix}"
+
+    df = df_full.copy()
+
+    # Velocidad a km/h
+    df["v_kmh"] = df[col_speed] * 3.6
+
+    # Limpieza base
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["v_kmh", col_radius, col_tang])
+
+    # Filtro radio útil
+    df = df[(df[col_radius] > 0) & (df[col_radius] < max_radius)]
+
+    # Filtro propulsión (fase de aceleración)
+    if propulsive_only:
+        df = df[df[col_tang] > 0]
+
+    # Bins de radio
+    bins = np.arange(0, max_radius + bin_width, bin_width)
+
+    envelopes = []
+
+    for sp in target_speeds:
+        vmin, vmax = sp - tolerance, sp + tolerance
+        df_sp = df[df["v_kmh"].between(vmin, vmax)].copy()
+        if df_sp.empty:
+            continue
+
+        df_sp["r_bin"] = pd.cut(df_sp[col_radius], bins=bins, include_lowest=True)
+
+        # Para cada bin, percentiles de acc_tang
+        grp = df_sp.groupby("r_bin", observed=True)[col_tang]
+
+        # solo bins con suficiente n
+        n_bin = grp.size()
+        valid_bins = n_bin[n_bin >= min_points_bin].index
+
+        if len(valid_bins) == 0:
+            continue
+
+        for p in percentiles:
+            q = (grp.quantile(p)
+                   .loc[valid_bins]
+                   .reset_index(name="Acc_Value"))
+            q["Radio_Mid"] = q["r_bin"].apply(lambda x: x.mid).astype(float)
+            q["Percentil"] = f"P{int(p*100)}"
+            q["Velocidad_Target"] = f"{sp} km/h"
+            q["p_float"] = p
+            q["n_bin"] = n_bin.loc[valid_bins].values
+            envelopes.append(q)
+
+    if not envelopes:
+        raise ValueError("No se generaron envolventes. Revisa filtros / columnas / datos.")
+    return pd.concat(envelopes, ignore_index=True)
+
+# ---------------------------------------------------------------------
+# 2) Configuración: método y títulos
+# ---------------------------------------------------------------------
+METHOD_SUFFIX = "_m1"  # cambia a "_m2_1" o "_m2_2"
+
+titles_map = {
+    "_m1":   "M1: Híbrido (Sensor)",
+    "_m2_1": "M2.1: Pitagórico (Media Móvil)",
+    "_m2_2": "M2.2: Pitagórico (Gaussiano)",
+}
+method_title = titles_map.get(METHOD_SUFFIX, METHOD_SUFFIX)
+
+# ---------------------------------------------------------------------
+# 3) Construcción de envolventes multi-percentiles
+# ---------------------------------------------------------------------
+df_env = build_envelopes_multi_percentiles(
+    df_full,
+    method_suffix=METHOD_SUFFIX,
+    target_speeds=(10, 15, 20),
+    tolerance=0.5,
+    percentiles=(0.50, 0.75, 0.90, 0.95, 0.99),
+    bin_width=2.0,
+    max_radius=60,
+    min_points_bin=25,
+    propulsive_only=True,   # <- tu objetivo: "fase de aceleración"
+)
+
+# ---------------------------------------------------------------------
+# 4) Plot: filas = Percentil, columnas = Velocidad (estilo anterior)
+# ---------------------------------------------------------------------
+sns.set_style("whitegrid")
+
+# Orden visual de percentiles
+order_p = ["P50","P75","P90","P95","P99"]
+
+g = sns.lmplot(
+    data=df_env,
+    x="Radio_Mid",
+    y="Acc_Value",
+    row="Percentil",
+    row_order=order_p,
+    col="Velocidad_Target",
+    col_order=[f"{s} km/h" for s in (10, 15, 20)],
+    hue="Velocidad_Target",  # colores por columna (como tu figura)
+    height=3.3,
+    aspect=1.35,
+    scatter_kws={"s": 38, "edgecolor": "white", "alpha": 0.85},
+    line_kws={"linewidth": 2, "color": "#333333"},
+    facet_kws={"sharex": True, "sharey": "row"},
+)
+
+g.map_dataframe(annotate_stats, x="Radio_Mid", y="Acc_Value")
+
+g.fig.suptitle(f"Envolventes por percentil (fase propulsiva): {method_title}", fontsize=16)
+g.set_axis_labels("Radio de giro (m)", "acc_tang (m/s²)")
+
+# Estética títulos de columnas (colores estilo)
+colores_columna = ["#4c72b0", "#dd8452", "#55a868"]
+for col_idx in range(g.axes.shape[1]):
+    c = colores_columna[col_idx] if col_idx < len(colores_columna) else "black"
+    for row_idx in range(g.axes.shape[0]):
+        ax = g.axes[row_idx, col_idx]
+        if ax.get_title():
+            ax.set_title(ax.get_title().replace("|", "").strip(),
+                         color=c, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+# Etiqueta izquierda por fila (Percentil)
+for i, ax_row in enumerate(g.axes):
+    ax_row[0].set_ylabel(f"{order_p[i]}  acc_tang (m/s²)", fontsize=10, fontweight="bold")
+
+g.fig.subplots_adjust(top=0.92, left=0.10)
+plt.show()
+
+```
+
+## Impulsividad por trayectoria. Jerk
+
+### Comportamiento Jerk por radio de giro. Velocidades fijas
+
+```{python}
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# ---------------------------
+# Anotación de regresión
+# ---------------------------
+def annotate_stats(data, x, y, **kws):
+    data = data[[x, y]].dropna()
+    if len(data) < 2:
+        return
+    slope, intercept, r_value, p_value, std_err = stats.linregress(data[x], data[y])
+    ax = plt.gca()
+    ax.text(
+        0.95, 0.85, f"m: {slope:.3f}\nr: {r_value:.2f}",
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7)
+    )
+
+# ---------------------------
+# 1) Construir jerk por sesión (source_file)
+# ---------------------------
+def add_jerk_tang_abs(
+    df,
+    acc_col="acc_tang_m1",
+    time_col="time",
+    group_col="source_file",
+    jerk_col_out="jerk_tang_abs",
+    min_dt=1e-3
+):
+    d = df.copy()
+
+    # Asegurar orden por grupo/tiempo
+    d = d.sort_values([group_col, time_col])
+
+    # Diferencias por grupo
+    da = d.groupby(group_col)[acc_col].diff()
+    dt = d.groupby(group_col)[time_col].diff()
+
+    # Evitar dt=0 o negativo
+    dt = dt.where(dt > min_dt)
+
+    d[jerk_col_out] = np.abs(da / dt)
+    return d
+
+# ---------------------------
+# 2) Envolvente jerk P99 por radio a v fijas
+# ---------------------------
+def build_jerk_p99_by_radius_at_speed_from_df_full(
+    df_full,
+    method="m1",                      # "m1", "m2_1", "m2_2"
+    target_speeds=(10, 15, 20),        # km/h
+    tolerance=0.75,                    # km/h
+    bin_width=2.0,                     # m
+    max_radius=60,                     # m
+    min_points_bin=25,
+    propulsive_only=False,             # filtra acc_tang>0 (post-jerk)
+    use_speed_kmh_col=False            # si True usa speed_kmh (columna existente) en vez de speed_mX*3.6
+):
+    # Columnas según método
+    speed_col = f"speed_{method}"      # p.ej. speed_m1
+    acc_col   = f"acc_tang_{method}"   # p.ej. acc_tang_m1
+    rad_col   = f"radius_{method}"     # p.ej. radius_m1
+
+    # En tu df aparecen como speed_m1, acc_tang_m1, radius_m1 (sin segundo guion bajo)
+    # Así que intentamos ambas opciones:
+    if speed_col not in df_full.columns:
+        speed_col = f"speed_{method}"  # (ya)
+    if speed_col not in df_full.columns:
+        speed_col = f"speed_{method}".replace("_", "")  # fallback raro
+    if speed_col not in df_full.columns:
+        speed_col = f"speed_{method}".replace("__", "_")
+
+    # Mejor: si el naming es speed_m1 (como en tu str), entonces:
+    if f"speed_{method}" not in df_full.columns and f"speed_{method}" != f"speed_{method}":
+        pass
+
+    # Naming real (según tu dump)
+    speed_col = f"speed_{method}" if f"speed_{method}" in df_full.columns else f"speed_{method}".replace("_", "")
+    # Pero tu dump muestra speed_m1 (con guion bajo). Entonces:
+    speed_col = f"speed_{method}" if f"speed_{method}" in df_full.columns else f"speed_{method}".replace("_", "_")
+    # Para no liarla: lo fijamos explícito según tu dump:
+    speed_col = f"speed_{method}" if f"speed_{method}" in df_full.columns else f"speed_{method}"
+
+    # En tu df: speed_m1, acc_tang_m1, radius_m1
+    speed_col = f"speed_{method}"
+    acc_col   = f"acc_tang_{method}"
+    rad_col   = f"radius_{method}"
+
+    required = {acc_col, rad_col, "time", "source_file"}
+    if not use_speed_kmh_col:
+        required.add(speed_col)
+    else:
+        required.add("speed_kmh")
+
+    missing = required - set(df_full.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas en df_full: {missing}")
+
+    df = df_full.copy()
+
+    # Limpieza base
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # Velocidad en km/h
+    if use_speed_kmh_col:
+        df["v_kmh"] = df["speed_kmh"]
+    else:
+        df["v_kmh"] = df[speed_col] * 3.6
+
+    df = df.dropna(subset=["v_kmh", acc_col, rad_col, "time", "source_file"])
+
+    # 1) jerk primero (importantísimo)
+    df = add_jerk_tang_abs(
+        df,
+        acc_col=acc_col,
+        time_col="time",
+        group_col="source_file",
+        jerk_col_out="jerk_tang_abs"
+    )
+
+    # 2) filtros después
+    df = df[np.isfinite(df["jerk_tang_abs"])]
+    df = df[(df[rad_col] > 0) & (df[rad_col] < max_radius)]
+    df = df[np.isfinite(df["v_kmh"])]
+
+    if propulsive_only:
+        df = df[df[acc_col] > 0]
+
+    # Binning radio
+    bins = np.arange(0, max_radius + bin_width, bin_width)
+    df["r_bin"] = pd.cut(df[rad_col], bins=bins, include_lowest=True)
+
+    out_rows = []
+    for sp in target_speeds:
+        sub = df[df["v_kmh"].between(sp - tolerance, sp + tolerance)].copy()
+        if sub.empty:
+            continue
+
+        grp = sub.groupby("r_bin", observed=True)["jerk_tang_abs"]
+        n_bin = grp.size()
+        valid_bins = n_bin[n_bin >= min_points_bin].index
+        if len(valid_bins) == 0:
+            continue
+
+        p99 = grp.quantile(0.99).loc[valid_bins]
+
+        tmp = p99.reset_index(name="Jerk_P99")
+        tmp["Radio_Mid"] = tmp["r_bin"].apply(lambda x: x.mid).astype(float)
+        tmp["Velocidad_Target"] = f"{sp} km/h"
+        tmp["n_bin"] = n_bin.loc[valid_bins].values
+        tmp["Metodo"] = method
+        out_rows.append(tmp)
+
+    if not out_rows:
+        raise ValueError(
+            "No hay datos suficientes para jerk P99.\n"
+            "Prueba: tolerance=1.0, min_points_bin=10-15, max_radius=80, propulsive_only=False."
+        )
+
+    return pd.concat(out_rows, ignore_index=True)
+
+# ---------------------------
+# 3) Plot (estilo anterior)
+# ---------------------------
+def plot_jerk_p99_lm(df_jerk, title):
+    sns.set_style("whitegrid")
+    g = sns.lmplot(
+        data=df_jerk,
+        x="Radio_Mid",
+        y="Jerk_P99",
+        col="Velocidad_Target",
+        col_order=sorted(df_jerk["Velocidad_Target"].unique(), key=lambda s: float(s.split()[0])),
+        hue="Velocidad_Target",
+        height=3.6,
+        aspect=1.4,
+        scatter_kws={"s": 45, "edgecolor": "white", "alpha": 0.85},
+        line_kws={"linewidth": 2, "color": "#333333"},
+        facet_kws={"sharex": True, "sharey": True}
+    )
+    g.map_dataframe(annotate_stats, x="Radio_Mid", y="Jerk_P99")
+    g.fig.suptitle(title, fontsize=16)
+    g.set_axis_labels("Radio de giro (m)", "Jerk tangencial P99 |m/s³|")
+    g.fig.subplots_adjust(top=0.83)
+    plt.show()
+
+# ---------------------------
+# USO (ejemplo)
+# ---------------------------
+df_jerk = build_jerk_p99_by_radius_at_speed_from_df_full(
+    df_full,
+    method="m1",               # cambia a "m2_2"
+    target_speeds=(10, 15, 20),
+    tolerance=1.0,
+    bin_width=2.0,
+    max_radius=60,
+    min_points_bin=25,
+    propulsive_only=False,     # empieza en False
+    use_speed_kmh_col=False    # usa speed_m1*3.6
+)
+
+plot_jerk_p99_lm(df_jerk, title="Jerk tangencial P99 vs radio (por velocidad objetivo) | M1")
+
+```
+
+## Heatmap jerk
+
+### Impulsividad longitudinal (P99−P50 acc_tang) vs (velocidad, radio)
+
+```{python}
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+def tail_spread_heatmap(
+    df_full,
+    method="m1",                 # "m1", "m2_1", "m2_2"
+    v_bin_kmh=1.0,
+    r_bin_m=2.0,
+    v_max=30,                    # ajusta según tus datos
+    r_max=60,
+    min_n=50,
+    propulsive_only=True,        # acc_tang > 0
+    use_speed_kmh_col=False      # True si quieres usar df_full["speed_kmh"]
+):
+    speed_col = f"speed_{method}"
+    acc_col   = f"acc_tang_{method}"
+    rad_col   = f"radius_{method}"
+
+    df = df_full.copy().replace([np.inf, -np.inf], np.nan)
+
+    # Velocidad km/h
+    if use_speed_kmh_col:
+        df["v_kmh"] = df["speed_kmh"]
+    else:
+        df["v_kmh"] = df[speed_col] * 3.6
+
+    df = df.dropna(subset=["v_kmh", acc_col, rad_col])
+    df = df[(df["v_kmh"] >= 0) & (df["v_kmh"] <= v_max)]
+    df = df[(df[rad_col] > 0) & (df[rad_col] <= r_max)]
+
+    if propulsive_only:
+        df = df[df[acc_col] > 0]
+
+    # Bins
+    v_bins = np.arange(0, v_max + v_bin_kmh, v_bin_kmh)
+    r_bins = np.arange(0, r_max + r_bin_m, r_bin_m)
+
+    df["v_bin"] = pd.cut(df["v_kmh"], bins=v_bins, include_lowest=True)
+    df["r_bin"] = pd.cut(df[rad_col], bins=r_bins, include_lowest=True)
+
+    g = (df.groupby(["v_bin", "r_bin"], observed=True)[acc_col]
+           .agg(n="size",
+                p50=lambda x: np.quantile(x, 0.50),
+                p99=lambda x: np.quantile(x, 0.99))
+           .reset_index())
+
+    g["tail_spread"] = g["p99"] - g["p50"]
+    g = g[g["n"] >= min_n].copy()
+
+    # Pivot para heatmap
+    pivot = g.pivot(index="v_bin", columns="r_bin", values="tail_spread")
+
+    # Etiquetas simples (midpoints)
+    pivot.index = [round(iv.mid, 1) for iv in pivot.index]
+    pivot.columns = [round(ir.mid, 1) for ir in pivot.columns]
+    pivot = pivot.sort_index(ascending=False)
+
+    plt.figure(figsize=(12, 7))
+    sns.heatmap(pivot, cmap="viridis", cbar_kws={"label": "P99 − P50  acc_tang (m/s²)"})
+    plt.title(f"Impulsividad longitudinal (P99−P50) vs (velocidad, radio) | {method} | min_n={min_n}")
+    plt.xlabel("Radio de giro (m)")
+    plt.ylabel("Velocidad (km/h)")
+    plt.tight_layout()
+    plt.show()
+
+    return g, pivot
+
+# --- USO ---
+g_m1, piv_m1 = tail_spread_heatmap(df_full, method="m1", v_max=30, r_max=60, v_bin_kmh=1.0, r_bin_m=2.0, min_n=80)
+# g_m22, piv_m22 = tail_spread_heatmap(df_full, method="m2_2", v_max=30, r_max=60, min_n=80)
+
+```
+
+### Brusquedad longitudinal (jerk P99) vs (velocidad, radio)
+
+```{python}
+from scipy import stats
+
+def jerk_p99_heatmap(
+    df_full,
+    method="m1",
+    v_bin_kmh=1.0,
+    r_bin_m=2.0,
+    v_max=30,
+    r_max=60,
+    min_n=50,
+    propulsive_only=False,
+    use_speed_kmh_col=False,
+    min_dt=1e-3
+):
+    speed_col = f"speed_{method}"
+    acc_col   = f"acc_tang_{method}"
+    rad_col   = f"radius_{method}"
+
+    df = df_full.copy().replace([np.inf, -np.inf], np.nan)
+
+    # km/h
+    if use_speed_kmh_col:
+        df["v_kmh"] = df["speed_kmh"]
+    else:
+        df["v_kmh"] = df[speed_col] * 3.6
+
+    df = df.dropna(subset=["v_kmh", acc_col, rad_col, "time", "source_file"])
+    df = df[(df["v_kmh"] >= 0) & (df["v_kmh"] <= v_max)]
+    df = df[(df[rad_col] > 0) & (df[rad_col] <= r_max)]
+
+    # jerk = |da/dt| por archivo
+    df = df.sort_values(["source_file", "time"])
+    da = df.groupby("source_file")[acc_col].diff()
+    dt = df.groupby("source_file")["time"].diff()
+    dt = dt.where(dt > min_dt)
+    df["jerk_abs"] = np.abs(da / dt)
+
+    df = df[np.isfinite(df["jerk_abs"])]
+
+    if propulsive_only:
+        df = df[df[acc_col] > 0]
+
+    # bins
+    v_bins = np.arange(0, v_max + v_bin_kmh, v_bin_kmh)
+    r_bins = np.arange(0, r_max + r_bin_m, r_bin_m)
+    df["v_bin"] = pd.cut(df["v_kmh"], bins=v_bins, include_lowest=True)
+    df["r_bin"] = pd.cut(df[rad_col], bins=r_bins, include_lowest=True)
+
+    g = (df.groupby(["v_bin", "r_bin"], observed=True)["jerk_abs"]
+           .agg(n="size", p99=lambda x: np.quantile(x, 0.99))
+           .reset_index())
+    g = g[g["n"] >= min_n].copy()
+
+    pivot = g.pivot(index="v_bin", columns="r_bin", values="p99")
+    pivot.index = [round(iv.mid, 1) for iv in pivot.index]
+    pivot.columns = [round(ir.mid, 1) for ir in pivot.columns]
+    pivot = pivot.sort_index(ascending=False)
+
+    plt.figure(figsize=(12, 7))
+    sns.heatmap(pivot, cmap="magma", cbar_kws={"label": "Jerk tangencial P99 |m/s³|"})
+    plt.title(f"Brusquedad longitudinal (jerk P99) vs (velocidad, radio) | {method} | min_n={min_n}")
+    plt.xlabel("Radio de giro (m)")
+    plt.ylabel("Velocidad (km/h)")
+    plt.tight_layout()
+    plt.show()
+
+    return g, pivot
+
+# --- USO ---
+gJ_m1, pivJ_m1 = jerk_p99_heatmap(df_full, method="m1", v_max=30, r_max=60, min_n=80)
+
+```
